@@ -22,13 +22,18 @@ std::unique_ptr<IExecutionProvider> CoreMLProviderFactory::CreateProvider() {
   return std::make_unique<CoreMLExecutionProvider>(coreml_flags_);
 }
 
-std::shared_ptr<IExecutionProviderFactory> CoreMLProviderFactoryCreator::Create(uint32_t coreml_flags) {
+std::shared_ptr<IExecutionProviderFactory> CoreMLProviderFactoryCreator::Create(const ProviderOptions& options) {
+  uint32_t coreml_flags = 0;
+  coreml_flags |= options.count("coreml_flags")
+                      ? std::stoi(options.at("coreml_flags"))
+                      : 0;
   return std::make_shared<onnxruntime::CoreMLProviderFactory>(coreml_flags);
 }
 }  // namespace onnxruntime
 
 ORT_API_STATUS_IMPL(OrtSessionOptionsAppendExecutionProvider_CoreML,
                     _In_ OrtSessionOptions* options, uint32_t coreml_flags) {
-  options->provider_factories.push_back(onnxruntime::CoreMLProviderFactoryCreator::Create(coreml_flags));
+  options->provider_factories.push_back(onnxruntime::CoreMLProviderFactoryCreator::Create(
+      {{"coreml_flags", std::to_string(coreml_flags)}}));
   return nullptr;
 }
