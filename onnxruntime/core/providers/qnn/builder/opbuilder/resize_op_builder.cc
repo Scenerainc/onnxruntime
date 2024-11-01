@@ -273,7 +273,9 @@ Status ResizeOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_w
   const bool is_npu_backend = IsNpuBackend(qnn_model_wrapper.GetQnnBackendType());
   std::string qnn_op_type = "Resize";
 
-  if (is_npu_backend && input_rank == 4 && interp_mode == "nearest" && nearest_mode == "floor") {
+  if (input_rank == 4 && interp_mode == "nearest" && nearest_mode == "floor") {
+		// Scenera note: We removed "is_npu_backend &&" so that GPU also gets the mapping Resize->ResizeNearestNeighbor
+		//
     // Translate Resize with
     // {input_rank: 4, mode: "nearest", nearest_mode: "floor", coordinate_transformation_mode: XXX} to
     // QNN's ResizeNearestNeighbor operator on the HTP backend. This combination of parameters is not supported on HTP
