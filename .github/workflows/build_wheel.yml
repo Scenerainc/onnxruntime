@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TAG_NAME: 1.18.2-scenera-eigen-test-5 // ${{ github.ref_name }}
+  TAG_NAME: 1.18.2-scenera-eigen-test-5 # ${{ github.ref_name }}
 
 jobs:
   build-wheel:
