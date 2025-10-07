@@ -44,11 +44,14 @@ jobs:
 
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          path: onnxruntime
 
       - name: Build ONNX Runtime (expected failure)
         id: build1
         continue-on-error: true
         run: |
+          cd onnxruntime
           export ADSP_LIBRARY_PATH=$PREFIX/qairt/2.22.6.240515/lib/hexagon-v68/unsigned/
           export CC=gcc-10
           export CXX=g++-10
@@ -60,6 +63,7 @@ jobs:
       - name: Build ONNX Runtime (expected success)
         if: steps.build1.outcome == 'failure'
         run: |
+          cd onnxruntime
           ./build.sh --parallel \
             --use_qnn --qnn_home=$PREFIX/qairt/2.22.6.240515/ \
             --build_shared_lib --skip_submodule_sync \
@@ -67,15 +71,15 @@ jobs:
 
       - name: Install and test the wheel
         run: |
-          ls ./build/Linux/Release/dist/*.whl
-          pip install ./build/Linux/Release/dist/*.whl
+          ls ./onnxruntime/build/Linux/Release/dist/*.whl
+          pip install ./onnxruntime/build/Linux/Release/dist/*.whl
           python3 -c "import onnxruntime as ort; print(ort.__version__); print(ort.get_available_providers())"
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
           name: onnxruntime-wheel
-          path: ./build/Linux/Release/dist/*.whl
+          path: ./onnxruntime/build/Linux/Release/dist/*.whl
 
   tag-release:
     needs: build-wheel
