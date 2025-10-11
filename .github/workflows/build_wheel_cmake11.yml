@@ -1,7 +1,7 @@
 on:
   push:
     branches:
-      - wheel
+      - mainUpstream
   workflow_dispatch:
 
 name: Build and Release ONNX Runtime - gcc13
