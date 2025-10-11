@@ -90,7 +90,7 @@ jobs:
       - name: Set dynamic tag name
         run: |
           BRANCH_NAME="${GITHUB_REF##*/}"
-          TAG_NAME="${BRANCH_NAME}-gcc13"
+          TAG_NAME="${BRANCH_NAME}-gcc13-test1"
           echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
 
       - name: Tag release
