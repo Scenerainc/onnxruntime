@@ -1,0 +1,128 @@
+on:
+  push:
+    branches:
+      - wheel
+  workflow_dispatch:
+
+name: Build and Release ONNX Runtime - gcc13
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  ONNX_RUNTIME_VERSION: main
+
+jobs:
+  build-wheel:
+    runs-on: Scenera-ARM64-Runner-4core-Ubuntu-24.04
+    outputs:
+      wheel_path: ${{ steps.set-output.outputs.wheel_path }}
+    steps:
+      - name: Setup paths
+        run: |
+          export PREFIX=$RUNNER_TEMP/local
+          echo "PREFIX=$PREFIX" >> $GITHUB_ENV
+
+      - name: Download Qualcomm SDK
+        run: |
+          mkdir -p $PREFIX
+          cd $PREFIX
+          wget https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/2.38.0.250901/v2.38.0.250901.zip 
+          unzip v2.38.0.250901.zip
+
+      - name: Check gcc versions
+        run: |
+          gcc -v
+
+      - name: Install numpy
+        run: sudo apt install -y python3-numpy
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          path: onnxruntime
+
+      - name: Build ONNX Runtime (expected failure)
+        id: build1
+        continue-on-error: true
+        run: |
+          cd onnxruntime
+          export ADSP_LIBRARY_PATH=$PREFIX/qairt/2.38.0.250901/lib/hexagon-v68/unsigned/
+          export CC=gcc
+          export CXX=g++
+          ./build.sh --parallel \
+            --use_qnn --qnn_home=$PREFIX/qairt/2.38.0.250901/ \
+            --build_shared_lib --skip_submodule_sync --allow_running_as_root \
+            --config Release --build_wheel --cmake_extra_defines onnxruntime_CXX_FLAGS="-Wno-error"
+
+      - name: Build ONNX Runtime (expected success)
+        if: steps.build1.outcome == 'failure'
+        run: |
+          cd onnxruntime
+          ./build.sh --parallel \
+            --use_qnn --qnn_home=$PREFIX/qairt/2.38.0.250901/ \
+            --build_shared_lib --skip_submodule_sync \
+            --config Release --build_wheel --build
+
+      - name: Install and test the wheel
+        run: |
+          ls ./onnxruntime/build/Linux/Release/dist/*.whl
+          pip install ./onnxruntime/build/Linux/Release/dist/*.whl
+          python3 -c "import onnxruntime as ort; print(ort.__version__); print(ort.get_available_providers())"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-wheel
+          path: ./onnxruntime/build/Linux/Release/dist/*.whl
+
+  tag-release:
+    needs: build-wheel
+    runs-on: Scenera-ARM64-Runner-4core-Ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set dynamic tag name
+        run: |
+          BRANCH_NAME="${GITHUB_REF##*/}"
+          TAG_NAME="${BRANCH_NAME}-gcc13"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
+
+      - name: Tag release
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag v${{ env.TAG_NAME }}
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git push origin v${{ env.TAG_NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-release:
+    needs: [build-wheel, tag-release]
+    runs-on: Scenera-ARM64-Runner-4core-Ubuntu-24.04
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: onnxruntime-wheel
+          path: ./wheel-download
+
+      - name: List all .whl files
+        run: find . -name "*.whl"
+
+      - name: Upload wheel to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.TAG_NAME }}
+          files: ./wheel-download/*.whl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete local wheel artifact
+        run: rm -rf ./wheel-download
