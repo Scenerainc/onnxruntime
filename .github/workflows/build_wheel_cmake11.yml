@@ -99,7 +99,7 @@ jobs:
           git config user.email "github-actions@github.com"
           git tag ${{ env.TAG_NAME }}
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
-          git push origin v${{ env.TAG_NAME }}
+          git push origin ${{ env.TAG_NAME }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
