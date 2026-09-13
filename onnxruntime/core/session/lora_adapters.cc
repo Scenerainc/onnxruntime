@@ -4,29 +4,21 @@
 #include "core/session/lora_adapters.h"
 #include "lora/adapter_format_utils.h"
 
+#include <unordered_map>
+
 #include "core/framework/data_transfer.h"
 #include "core/framework/error_code_helper.h"
-#include "core/framework/execution_provider.h"
 #include "core/session/onnxruntime_c_api.h"
 #include "core/session/allocator_adapters.h"
 #include "core/session/ort_apis.h"
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_CUDA_PROVIDER_INTERFACE)
 #include "core/providers/cuda/cuda_provider_factory.h"
 #endif
 
-#ifdef USE_DML
-#include "core/session/abi_session_options_impl.h"
-#include "core/providers/dml/dml_provider_factory_creator.h"
-#include "core/providers/dml/dml_provider_factory.h"
-#endif
-
-#include <functional>
-#include <unordered_map>
-
 namespace onnxruntime {
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_CUDA_PROVIDER_INTERFACE)
 ProviderInfo_CUDA* TryGetProviderInfo_CUDA();
 #endif
 
@@ -45,71 +37,59 @@ void LoraAdapter::Load(const std::filesystem::path& file_path) {
 }
 
 void LoraAdapter::Load(std::vector<uint8_t> buffer) {
-  adapter_ = adapters::utils::ValidateAndGetAdapterFromBytes(buffer);
+  // Build everything that can throw against locals first, so a malformed adapter
+  // leaves *this unchanged (strong exception guarantee). Only after the new
+  // parameter map has been fully constructed do we release the previous backing
+  // storage and swap in the new state. ValidateAndGetAdapterFromBytes returns a
+  // pointer that aliases `buffer`'s data; std::vector's move preserves the data
+  // pointer, so the alias remains valid after we move `buffer` into buffer_.
+  const auto* new_adapter = adapters::utils::ValidateAndGetAdapterFromBytes(buffer);
+  auto new_params_values = BuildParamsValues(new_adapter);
+
+  // Commit. None of the operations below can throw.
   buffer_.emplace<BufferHolder>(std::move(buffer));
-  InitializeParamsValues();
+  adapter_ = new_adapter;
+  params_values_ = std::move(new_params_values);
 }
 
 void LoraAdapter::MemoryMap(const std::filesystem::path& file_path) {
   auto [mapped_memory, file_size] = adapters::utils::MemoryMapAdapterFile(file_path);
   auto u8_span = ReinterpretAsSpan<const uint8_t>(gsl::make_span(mapped_memory.get(), file_size));
-  adapter_ = adapters::utils::ValidateAndGetAdapterFromBytes(u8_span);
+
+  // Build everything that can throw against locals first; see Load() above.
+  // Moving Env::MappedMemoryPtr preserves the underlying pointer, so OrtValues
+  // built against `mapped_memory.get()` remain valid after the move into buffer_.
+  const auto* new_adapter = adapters::utils::ValidateAndGetAdapterFromBytes(u8_span);
+  auto new_params_values = BuildParamsValues(new_adapter);
+
+  // Commit. None of the operations below can throw.
   buffer_.emplace<MemMapHolder>(std::move(mapped_memory), file_size);
-  InitializeParamsValues();
+  adapter_ = new_adapter;
+  params_values_ = std::move(new_params_values);
 }
 
-namespace {
-struct DataTransfer {
-  std::unique_ptr<IExecutionProvider> ep;
+static std::unique_ptr<IDataTransfer> GetDataTransfer(const OrtMemoryInfo& mem_info) {
   std::unique_ptr<IDataTransfer> data_transfer;
-  bool is_dml = false;
-  Status CopyTensor(const Tensor& src, Tensor& dst) const {
-    return data_transfer->CopyTensor(src, dst);
-  }
-  Status Sync() const {
-    if (is_dml) {
-      return ep->Sync();
-    } else {
-      return Status::OK();
-    }
-  }
-};
-}  // namespace
 
-static Status GetDataTransfer(const OrtMemoryInfo& mem_info, [[maybe_unused]] DataTransfer& dt) {
-  ORT_RETURN_IF(strcmp(mem_info.name, onnxruntime::CPU) == 0, "Expecting on device allocator for LoraAdapter");
+  if (mem_info.device.Type() == OrtDevice::CPU) {
+    return data_transfer;
+  }
 
-  Status status;
-  if (strcmp(mem_info.name, onnxruntime::CUDA) == 0) {
-#ifdef USE_CUDA
+  if (mem_info.device.Type() == OrtDevice::GPU && mem_info.device.Vendor() == OrtDevice::VendorIds::NVIDIA) {
+#if defined(USE_CUDA) || defined(USE_CUDA_PROVIDER_INTERFACE)
     auto* cuda_provider_info = TryGetProviderInfo_CUDA();
     if (cuda_provider_info != nullptr) {
-      dt.data_transfer = cuda_provider_info->CreateGPUDataTransfer();
-    } else {
-      status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "CUDA provider could not be loaded");
+      data_transfer = cuda_provider_info->CreateGPUDataTransfer();
     }
-#else
-    status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "CUDA provider is not enabled in this build");
 #endif
-  } else if (strcmp(mem_info.name, onnxruntime::DML) == 0) {
-#ifdef USE_DML
-    auto ep_factory = onnxruntime::DMLProviderFactoryCreator::Create(ConfigOptions{}, 0, false, false, false);
-    dt.ep = ep_factory->CreateProvider();
-    dt.is_dml = true;
-    dt.data_transfer = dt.ep->GetDataTransfer();
-#else
-    status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "DML provider is not enabled in this build");
-#endif
-  } else {
-    status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Unsupported device allocator");
   }
 
-  return status;
+  return data_transfer;
 }
 
 static Status CreateOrtValueOnDevice(const OrtValue& ort_value_mapped,
                                      const AllocatorPtr& device_allocator,
-                                     const DataTransfer& data_transfer,
+                                     const IDataTransfer& data_transfer,
                                      OrtValue& out) {
   OrtValue result;
   const auto& src = ort_value_mapped.Get<Tensor>();
@@ -120,27 +100,34 @@ static Status CreateOrtValueOnDevice(const OrtValue& ort_value_mapped,
   return Status::OK();
 }
 
-void LoraAdapter::InitializeParamsValues() {
-  if (adapter_ == nullptr) {
-    ORT_THROW("Adapter is not loaded yet.");
-  }
+std::unordered_map<std::string, LoraAdapter::Param>
+LoraAdapter::BuildParamsValues(const adapters::Adapter* adapter) const {
+  ORT_ENFORCE(adapter != nullptr, "Adapter is not loaded yet.");
 
-  DataTransfer data_transfer;
+  std::unique_ptr<IDataTransfer> data_transfer;
   if (device_allocator_) {
-    ORT_THROW_IF_ERROR(GetDataTransfer(device_allocator_->Info(), data_transfer));
+    const auto& allocator_info = device_allocator_->Info();
+    if (allocator_info.device.Type() == OrtDevice::CPU) {
+      ORT_THROW("The specified allocator must be a device allocator");
+    }
+
+    data_transfer = GetDataTransfer(allocator_info);
+    // Plugin EP data transfers are registered with the environment/session and are not
+    // available during adapter creation. Keep the mapped CPU values in that case so Run()
+    // can copy them through the session's data transfer manager.
   }
 
-  const auto* params = adapter_->parameters();
+  const auto* params = adapter->parameters();
   ORT_ENFORCE(params != nullptr, "Params absent");
   std::unordered_map<std::string, Param> params_values;
   params_values.reserve(params->size());
   // Re-work in two separate loops due to compiler issues
-  if (device_allocator_) {
+  if (data_transfer) {
     for (const auto* param : *params) {
       auto [name, ort_value] = adapters::utils::CreateOrtValueOverLoraParameter(*param);
       OrtValue ort_value_ondevice;
       ORT_THROW_IF_ERROR(CreateOrtValueOnDevice(ort_value, device_allocator_,
-                                                data_transfer, ort_value_ondevice));
+                                                *data_transfer, ort_value_ondevice));
       Param lora_param(std::move(ort_value), std::move(ort_value_ondevice));
       params_values.emplace(std::move(name), std::move(lora_param));
     }
@@ -152,11 +139,7 @@ void LoraAdapter::InitializeParamsValues() {
     }
   }
 
-  if (device_allocator_) {
-    ORT_THROW_IF_ERROR(data_transfer.Sync());
-  }
-
-  params_values_.swap(params_values);
+  return params_values;
 }
 
 }  // namespace lora

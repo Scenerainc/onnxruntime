@@ -41,7 +41,7 @@ const std::vector<float> GetExpectedResult(const std::vector<float>& input_data,
   return ComputeGelu(add_bias_data);
 }
 
-#if defined(USE_CUDA) || defined(USE_ROCM) || defined(USE_WEBGPU)
+#if defined(USE_CUDA) || defined(USE_WEBGPU)
 static void RunFastGeluGpuTest(const std::vector<float>& input_data, const std::vector<float>& bias_data,
                                const std::vector<float>& output_data, const std::vector<int64_t>& input_dims,
                                const std::vector<int64_t>& bias_dims, const std::vector<int64_t>& output_dims,
@@ -73,8 +73,6 @@ static void RunFastGeluGpuTest(const std::vector<float>& input_data, const std::
   std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
 #ifdef USE_CUDA
   execution_providers.push_back(DefaultCudaExecutionProvider());
-#elif USE_ROCM
-  execution_providers.push_back(DefaultRocmExecutionProvider());
 #elif USE_WEBGPU
   execution_providers.push_back(DefaultWebGpuExecutionProvider());
 #endif
@@ -144,7 +142,7 @@ static void RunFastGeluTest(
   std::vector<int64_t> input_dims = {batch_size, sequence_length, hidden_size};
   std::vector<int64_t> bias_dims = {hidden_size};
   std::vector<int64_t> output_dims = input_dims;
-#if defined(USE_CUDA) || defined(USE_ROCM) || defined(USE_WEBGPU)
+#if defined(USE_CUDA) || defined(USE_WEBGPU)
   RunFastGeluGpuTest(input_data, bias_data, output_data, input_dims, bias_dims, output_dims, has_bias);
 #endif
   RunFastGeluCpuTest(input_data, bias_data, output_data, input_dims, bias_dims, output_dims, has_bias);
@@ -162,6 +160,18 @@ TEST(FastGeluTest, FastGeluWithNullInput) {
 
   RunFastGeluTest(input_data, bias_data, batch_size, sequence_length, hidden_size);
 }
+
+// An empty input (with a correspondingly empty bias) is a legal degenerate case per the ONNX
+// shape model. The CPU/CUDA kernels must treat it as a no-op rather than divide the (zero) input
+// element count by the (zero) bias length.
+TEST(FastGeluTest, ZeroLengthBiasIsNoOp) {
+  OpTester tester("FastGelu", 1, onnxruntime::kMSDomain);
+  tester.AddInput<float>("X", {2, 0}, {});
+  tester.AddInput<float>("bias", {0}, {});
+  tester.AddOutput<float>("Y", {2, 0}, {});
+  tester.Run();
+}
+
 #if defined(USE_DNNL)
 TEST(FastGeluTest, FastGeluWithBias_bfloat16) {
 #ifdef USE_DNNL
@@ -247,8 +257,8 @@ TEST(FastGeluTest, FastGeluWithoutBiasFloat32) {
   RunFastGeluTest(input_data, bias_data, batch_size, sequence_length, hidden_size);
 }
 
-// CUDA, ROCm and WebGPU only for Float16 type.
-#if defined(USE_CUDA) || defined(USE_ROCM) || defined(USE_WEBGPU)
+// CUDA and WebGPU only for Float16 type.
+#if defined(USE_CUDA) || defined(USE_WEBGPU)
 TEST(FastGeluTest, FastGeluWithBiasFloat16_2) {
   int batch_size = 1;
   int sequence_length = 2;
@@ -385,11 +395,11 @@ TEST(FastGeluTest, FastGeluWithoutBiasFloat16_8) {
 }
 #endif
 
-// CUDA and ROCm only for BFloat16 type.
-#if defined(USE_CUDA) || defined(USE_ROCM)
+// CUDA only for BFloat16 type.
+#if defined(USE_CUDA)
 TEST(FastGeluTest, FastGeluWithBias_BFloat16) {
 #ifdef USE_CUDA
-  int min_cuda_architecture = 530;
+  int min_cuda_architecture = 800;
   if (!HasCudaEnvironment(min_cuda_architecture)) {
     LOGS_DEFAULT(WARNING) << "Hardware NOT support BFP16";
     return;
@@ -433,8 +443,42 @@ TEST(FastGeluTest, FastGeluWithBias_BFloat16) {
   std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
 #ifdef USE_CUDA
   execution_providers.push_back(DefaultCudaExecutionProvider());
-#elif USE_ROCM
-  execution_providers.push_back(DefaultRocmExecutionProvider());
+#endif
+  tester.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
+#endif
+
+// CUDA only for double type.
+#if defined(USE_CUDA)
+TEST(FastGeluTest, FastGeluWithBias_Double) {
+  OpTester tester("FastGelu", 1, onnxruntime::kMSDomain);
+
+  int batch_size = 1;
+  int sequence_length = 2;
+  int hidden_size = 4;
+
+  std::vector<double> X = {
+      0.8, -0.5, 0.0, 1.0,
+      0.5, 0.2, 0.3, -0.6};
+
+  std::vector<double> B = {
+      -0.5, 0.6, 1.2, 2.1};
+
+  std::vector<double> Y = {
+      0.185371, 0.053983, 1.061703, 3.097373,
+      0.000000, 0.630432, 1.399572, 1.399572};
+
+  std::vector<int64_t> input_dims = {batch_size, sequence_length, hidden_size};
+  std::vector<int64_t> bias_dims = {hidden_size};
+  std::vector<int64_t> output_dims = input_dims;
+
+  tester.AddInput<double>("X", input_dims, X);
+  tester.AddInput<double>("bias", bias_dims, B);
+  tester.AddOutput<double>("Y", output_dims, Y);
+
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+#ifdef USE_CUDA
+  execution_providers.push_back(DefaultCudaExecutionProvider());
 #endif
   tester.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
 }

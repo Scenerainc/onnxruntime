@@ -2,12 +2,11 @@
 // Licensed under the MIT License.
 
 #include "test/providers/compare_provider_test_utils.h"
-#include "test/util/include/default_providers.h"
 
 namespace onnxruntime {
 namespace test {
 
-#if defined(USE_CUDA) || defined(USE_ROCM) || defined(USE_DML) || defined(USE_WEBGPU)
+#if defined(USE_CUDA) || defined(USE_DML) || defined(USE_WEBGPU)
 constexpr auto k_epsilon_default = 1e-5f;
 constexpr auto k_random_data_min = -10.0f;
 constexpr auto k_random_data_max = 10.0f;
@@ -80,19 +79,11 @@ static void TestLayerNorm(const std::vector<int64_t>& x_dims,
 #endif
 
 #ifdef USE_CUDA
-  if (DefaultCudaExecutionProvider() != nullptr) {
-    test.CompareWithCPU(kCudaExecutionProvider);
-  }
-#elif USE_ROCM
-  test.CompareWithCPU(kRocmExecutionProvider);
+  test.CompareWithCPU(kCudaExecutionProvider);
+#elif USE_DML
+  test.CompareWithCPU(kDmlExecutionProvider);
 #elif USE_WEBGPU
   test.CompareWithCPU(kWebGpuExecutionProvider);
-#endif
-
-#ifdef USE_DML
-  if (DefaultDmlExecutionProvider() != nullptr) {
-    test.CompareWithCPU(kDmlExecutionProvider);
-  }
 #endif
 }
 

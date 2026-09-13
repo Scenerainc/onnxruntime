@@ -191,8 +191,6 @@ class GpuDataManagerImpl implements GpuDataManager {
   // GPU Data ID => GPU Data ( storage buffer )
   private storageCache: Map<GpuDataId, StorageCacheValue>;
 
-  // pending buffers for uploading ( data is unmapped )
-  private buffersForUploadingPending: GPUBuffer[];
   // pending buffers for computing
   private buffersPending: GPUBuffer[];
 
@@ -212,7 +210,6 @@ class GpuDataManagerImpl implements GpuDataManager {
     this.storageCache = new Map();
     this.freeBuffers = new Map();
     this.freeUniformBuffers = new Map();
-    this.buffersForUploadingPending = [];
     this.buffersPending = [];
     this.capturedPendingBuffers = new Map();
 
@@ -240,25 +237,16 @@ class GpuDataManagerImpl implements GpuDataManager {
       throw new Error(`inconsistent data size. gpu data size=${gpuDataCache.originalSize}, data size=${srcLength}`);
     }
 
-    // create gpu buffer
-    const gpuBufferForUploading = this.backend.device.createBuffer(
-      // eslint-disable-next-line no-bitwise
-      { mappedAtCreation: true, size, usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC },
-    );
-
-    // copy (upload) data
-    const arrayBuffer = gpuBufferForUploading.getMappedRange();
-    new Uint8Array(arrayBuffer).set(new Uint8Array(srcArrayBuffer, srcOffset, srcLength));
-    gpuBufferForUploading.unmap();
-
-    // GPU copy
-    const commandEncoder = this.backend.getCommandEncoder();
-    this.backend.endComputePass();
-    commandEncoder.copyBufferToBuffer(gpuBufferForUploading, 0, gpuDataCache.gpuData.buffer, 0, size);
+    if (size === srcLength && srcOffset % 4 === 0) {
+      // Fast path: already aligned; avoid allocating/copying a padded buffer.
+      this.backend.device.queue.writeBuffer(gpuDataCache.gpuData.buffer, 0, srcArrayBuffer, srcOffset, srcLength);
+    } else {
+      const uploadData = new Uint8Array(size);
+      uploadData.set(data);
+      this.backend.device.queue.writeBuffer(gpuDataCache.gpuData.buffer, 0, uploadData, 0, size);
+    }
 
     LOG_DEBUG('verbose', () => `[WebGPU] GpuDataManager.upload(id=${id})`);
-
-    this.buffersForUploadingPending.push(gpuBufferForUploading);
   }
 
   memcpy(sourceId: GpuDataId, destinationId: GpuDataId): void {
@@ -395,12 +383,6 @@ class GpuDataManagerImpl implements GpuDataManager {
   }
 
   refreshPendingBuffers(): void {
-    for (const buffer of this.buffersForUploadingPending) {
-      // upload buffer is only useful in the session creation time. So we don't need to reuse them in session running.
-      buffer.destroy();
-    }
-    this.buffersForUploadingPending = [];
-
     if (this.buffersPending.length === 0) {
       return;
     }

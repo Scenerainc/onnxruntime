@@ -22,18 +22,11 @@ parameters:
 - name: ScriptName
   type: string
   default: "tools/ci_build/get_docker_image.py"
-- name: UpdateDepsTxt
-  type: boolean
-  default: true
 - name: IMAGE_CACHE_DIR
   type: string
   default: $(Agent.TempDirectory)/docker
 
 steps:
-
-- ${{ if eq(parameters.UpdateDepsTxt, true)}}:
-  - template: download-deps.yml
-
 - ${{ if eq(parameters.CheckOutManyLinux, true) }}:
     - checkout: manylinux
     - script: |
@@ -56,6 +49,8 @@ steps:
     docker version
     docker image ls
     docker system df
+    docker info  |grep '^\s* Docker Root'
+    df -h
   displayName: Check Docker Images
 
 - ${{ if eq(parameters.UseImageCacheContainerRegistry, true) }}:
@@ -70,6 +65,8 @@ steps:
             --container-registry onnxruntimebuildcache \
             --repository "${{ parameters.Repository }}"
         displayName: "Get ${{ parameters.Repository }} image for ${{ parameters.Dockerfile }}"
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
       ContainerRegistry: onnxruntimebuildcache
 - ${{ if eq(parameters.UseImageCacheContainerRegistry, false) }}:
   # the difference is no --container-registry
@@ -83,6 +80,8 @@ steps:
             --docker-build-args "${{ parameters.DockerBuildArgs }}" \
             --repository "${{ parameters.Repository }}"
         displayName: "Get ${{ parameters.Repository }} image for ${{ parameters.Dockerfile }}"
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
       ContainerRegistry: onnxruntimebuildcache
 
 - script: |
@@ -91,12 +90,3 @@ steps:
     docker system df
     df -h
   displayName: Check Docker Images
-
-- ${{ if and(eq(parameters.UpdateDepsTxt, true), or(eq(variables['System.CollectionId'], 'f3ad12f2-e480-4533-baf2-635c95467d29'),eq(variables['System.CollectionId'], 'bc038106-a83b-4dab-9dd3-5a41bc58f34c'))) }}:
-  - task: PythonScript@0
-    displayName: 'Update deps.txt'
-    inputs:
-      scriptPath: $(Build.SourcesDirectory)/tools/ci_build/replace_urls_in_deps.py
-      arguments: --new_dir /build/deps
-      workingDirectory: $(Build.BinariesDirectory)
-      pythonInterpreter: /usr/bin/python3

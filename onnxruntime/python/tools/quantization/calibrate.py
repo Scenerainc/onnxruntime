@@ -5,13 +5,16 @@
 # license information.
 # --------------------------------------------------------------------------
 import abc
+import contextlib
 import copy
 import itertools
+import json
 import os
+import tempfile
 import uuid
+from collections.abc import Sequence
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnx
@@ -39,7 +42,7 @@ def rel_entr(pk: np.ndarray, qk: np.ndarray) -> np.ndarray:
 def entropy(
     pk: np.ndarray,
     qk: np.ndarray,
-    base: Optional[float] = None,
+    base: float | None = None,
     axis: int = 0,
 ) -> np.ndarray:
     """
@@ -98,9 +101,24 @@ class TensorData:
         data["CLS"] = self.__class__.__name__
         return data
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "TensorData":
+        """Reconstruct a TensorData from a dict produced by to_dict()."""
+        kwargs = {}
+        for k, v in d.items():
+            if k == "CLS":
+                continue
+            value = v
+            if isinstance(value, dict) and value.get("CLS") == "numpy.array":
+                value = np.array(value["data"], dtype=np.dtype(value["dtype"]))
+            elif k in cls._floats and isinstance(value, (int, float)):
+                value = np.array(value, dtype=np.float32)
+            kwargs[k] = value
+        return cls(**kwargs)
+
 
 class TensorsData:
-    def __init__(self, calibration_method, data: Dict[str, Union[TensorData, Tuple]]):
+    def __init__(self, calibration_method, data: dict[str, TensorData | tuple]):
         self.calibration_method = calibration_method
         self.data = {}
         for k, v in data.items():
@@ -150,6 +168,18 @@ class TensorsData:
         }
         return data
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "TensorsData":
+        """Reconstruct a TensorsData from a dict produced by to_dict()."""
+        method_val = d["calibration_method"]
+        if isinstance(method_val, dict) and method_val.get("CLS") == "CalibrationMethod":
+            name = method_val["value"].split(".")[-1]
+            method = CalibrationMethod[name]
+        else:
+            method = method_val
+        reconstructed = {k: TensorData.from_dict(v) for k, v in d["data"].items()}
+        return cls(method, reconstructed)
+
 
 class CalibrationMethod(Enum):
     MinMax = 0
@@ -161,7 +191,7 @@ class CalibrationMethod(Enum):
 class CalibrationDataReader(metaclass=abc.ABCMeta):
     @classmethod
     def __subclasshook__(cls, subclass):
-        return hasattr(subclass, "get_next") and callable(subclass.get_next) or NotImplemented
+        return (hasattr(subclass, "get_next") and callable(subclass.get_next)) or NotImplemented
 
     @abc.abstractmethod
     def get_next(self) -> dict:
@@ -184,11 +214,67 @@ class CalibrationDataReader(metaclass=abc.ABCMeta):
         raise NotImplementedError
 
 
+class CalibrationCacheEncoder(json.JSONEncoder):
+    """Shared JSON encoder for calibration caches.
+
+    Handles numpy ndarrays and numpy scalar types (integer/floating) so
+    calibration JSON output is consistent across ``save_tensors_data`` and
+    ``quant_utils.write_calibration_table``.
+    """
+
+    def default(self, obj):
+        if isinstance(obj, (TensorData, TensorsData)):
+            return obj.to_dict()
+        if isinstance(obj, np.ndarray):
+            return {"data": obj.tolist(), "dtype": str(obj.dtype), "CLS": "numpy.array"}
+        if isinstance(obj, CalibrationMethod):
+            return {"CLS": obj.__class__.__name__, "value": str(obj)}
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        return json.JSONEncoder.default(self, obj)
+
+
+def save_tensors_data(tensors_data: "TensorsData", path: "str | Path", *, smooth_quant: bool = False) -> None:
+    """Serialize calibration tensor ranges to a JSON file at *path*.
+
+    :param smooth_quant: whether the producing run used SmoothQuant.  Stored in
+        the cache so a later load can detect a mismatch and recompute.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".calibcache_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            payload = tensors_data.to_dict()
+            payload["smooth_quant"] = smooth_quant
+            json.dump(payload, f, cls=CalibrationCacheEncoder)
+            f.flush()
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+        raise
+
+
+def load_tensors_data(path: "str | Path") -> "TensorsData":
+    """Load calibration tensor ranges from a JSON file written by save_tensors_data()."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Calibration cache not found: {path}")
+    if not path.is_file():
+        raise ValueError(f"Calibration cache path is not a file: {path}")
+    with path.open("r") as f:
+        d = json.load(f)
+    return TensorsData.from_dict(d)
+
+
 class CalibraterBase:
     def __init__(
         self,
-        model_path: Union[str, Path],
-        op_types_to_calibrate: Optional[Sequence[str]] = None,
+        model_path: str | Path,
+        op_types_to_calibrate: Sequence[str] | None = None,
         augmented_model_path="augmented_model.onnx",
         symmetric=False,
         use_external_data_format=False,
@@ -297,8 +383,8 @@ class CalibraterBase:
 class MinMaxCalibrater(CalibraterBase):
     def __init__(
         self,
-        model_path: Union[str, Path],
-        op_types_to_calibrate: Optional[Sequence[str]] = None,
+        model_path: str | Path,
+        op_types_to_calibrate: Sequence[str] | None = None,
         augmented_model_path="augmented_model.onnx",
         symmetric=False,
         use_external_data_format=False,
@@ -353,6 +439,14 @@ class MinMaxCalibrater(CalibraterBase):
                     return opset_import.version
             raise RuntimeError(f"Model does not contain a version for '{op_type}'.")
 
+        def insert_nodes(tensor_name, new_nodes):
+            index = next(
+                (i for i, x in enumerate(self.model.graph.node) if tensor_name in x.input), len(self.model.graph.node)
+            )
+            for node in new_nodes:
+                self.model.graph.node.insert(index, node)
+                index += 1
+
         def add_reduce_min_max(tensor_name, reduce_op_name):
             # When doing ReduceMax/ReduceMin, ORT can't reduce on dim with value of 0 if 'keepdims' is false.
             # To make the code simple, we always let keepdims to be 1.
@@ -380,7 +474,7 @@ class MinMaxCalibrater(CalibraterBase):
             else:
                 raise ValueError(
                     f"Unable to guess tensor type for tensor {tensor_name!r}, "
-                    f"running shape inference before quantization may resolve this issue."
+                    "running shape inference before quantization may resolve this issue."
                 )
 
             # Include axes in reduce_op when per_channel, always keeping axis=1
@@ -396,7 +490,7 @@ class MinMaxCalibrater(CalibraterBase):
                     reduce_node.input.append(reduce_axes_name)
                     self.model.graph.initializer.append(reduce_axes)
 
-            self.model.graph.node.extend([reduce_node, reshape_node])
+            insert_nodes(tensor_name, [reduce_node, reshape_node])
             self.model.graph.output.append(helper.make_tensor_value_info(reduce_output, onnx_type, [None]))
 
         for tensor in tensors:
@@ -417,7 +511,14 @@ class MinMaxCalibrater(CalibraterBase):
             inputs = data_reader.get_next()
             if not inputs:
                 break
-            self.intermediate_outputs.append(self.infer_session.run(None, inputs))
+            self.intermediate_outputs.append(
+                [
+                    value if sess_o.name not in self.model_original_outputs else None
+                    for sess_o, value in zip(
+                        self.infer_session.get_outputs(), self.infer_session.run(None, inputs), strict=False
+                    )
+                ]
+            )
             if (
                 self.max_intermediate_outputs is not None
                 and len(self.intermediate_outputs) == self.max_intermediate_outputs
@@ -476,7 +577,8 @@ class MinMaxCalibrater(CalibraterBase):
 
         output_names = [self.infer_session.get_outputs()[i].name for i in range(len(self.intermediate_outputs[0]))]
         output_dicts_list = [
-            dict(zip(output_names, intermediate_output)) for intermediate_output in self.intermediate_outputs
+            dict(zip(output_names, intermediate_output, strict=False))
+            for intermediate_output in self.intermediate_outputs
         ]
 
         merged_output_dict = {}
@@ -495,19 +597,21 @@ class MinMaxCalibrater(CalibraterBase):
         pairs = []
         for i in range(0, len(added_output_names), 2):
             if self.moving_average:
-                min_value_array = np.mean(merged_added_output_dict[added_output_names[i]], axis=0)
-                max_value_array = np.mean(merged_added_output_dict[added_output_names[i + 1]], axis=0)
+                min_value_array = np.nanmean(merged_added_output_dict[added_output_names[i]], axis=0)
+                max_value_array = np.nanmean(merged_added_output_dict[added_output_names[i + 1]], axis=0)
             else:
-                min_value_array = np.min(merged_added_output_dict[added_output_names[i]], axis=0)
-                max_value_array = np.max(merged_added_output_dict[added_output_names[i + 1]], axis=0)
+                min_value_array = np.nanmin(merged_added_output_dict[added_output_names[i]], axis=0)
+                max_value_array = np.nanmax(merged_added_output_dict[added_output_names[i + 1]], axis=0)
 
             if self.symmetric:
-                max_absolute_value = np.max([np.abs(min_value_array), np.abs(max_value_array)], axis=0)
-                pairs.append(tuple([-max_absolute_value, max_absolute_value]))
+                max_absolute_value = np.nanmax([np.abs(min_value_array), np.abs(max_value_array)], axis=0)
+                pairs.append((-max_absolute_value, max_absolute_value))
             else:
-                pairs.append(tuple([min_value_array, max_value_array]))
+                pairs.append((min_value_array, max_value_array))
 
-        new_calibrate_tensors_range = TensorsData(CalibrationMethod.MinMax, dict(zip(calibrate_tensor_names, pairs)))
+        new_calibrate_tensors_range = TensorsData(
+            CalibrationMethod.MinMax, dict(zip(calibrate_tensor_names, pairs, strict=False))
+        )
         if self.calibrate_tensors_range:
             self.calibrate_tensors_range = self.merge_range(self.calibrate_tensors_range, new_calibrate_tensors_range)
         else:
@@ -519,8 +623,8 @@ class MinMaxCalibrater(CalibraterBase):
 class HistogramCalibrater(CalibraterBase):
     def __init__(
         self,
-        model_path: Union[str, Path],
-        op_types_to_calibrate: Optional[Sequence[str]] = None,
+        model_path: str | Path,
+        op_types_to_calibrate: Sequence[str] | None = None,
         augmented_model_path="augmented_model.onnx",
         use_external_data_format=False,
         method="percentile",
@@ -608,7 +712,8 @@ class HistogramCalibrater(CalibraterBase):
             raise ValueError("No data is collected.")
 
         output_dicts_list = [
-            dict(zip(output_names, intermediate_output)) for intermediate_output in self.intermediate_outputs
+            dict(zip(output_names, intermediate_output, strict=False))
+            for intermediate_output in self.intermediate_outputs
         ]
 
         merged_dict = {}
@@ -653,8 +758,8 @@ class HistogramCalibrater(CalibraterBase):
 class EntropyCalibrater(HistogramCalibrater):
     def __init__(
         self,
-        model_path: Union[str, Path],
-        op_types_to_calibrate: Optional[Sequence[str]] = None,
+        model_path: str | Path,
+        op_types_to_calibrate: Sequence[str] | None = None,
         augmented_model_path="augmented_model.onnx",
         use_external_data_format=False,
         method="entropy",
@@ -687,8 +792,8 @@ class EntropyCalibrater(HistogramCalibrater):
 class PercentileCalibrater(HistogramCalibrater):
     def __init__(
         self,
-        model_path: Union[str, Path],
-        op_types_to_calibrate: Optional[Sequence[str]] = None,
+        model_path: str | Path,
+        op_types_to_calibrate: Sequence[str] | None = None,
         augmented_model_path="augmented_model.onnx",
         use_external_data_format=False,
         method="percentile",
@@ -721,8 +826,8 @@ class PercentileCalibrater(HistogramCalibrater):
 class DistributionCalibrater(HistogramCalibrater):
     def __init__(
         self,
-        model_path: Union[str, Path],
-        op_types_to_calibrate: Optional[Sequence[str]] = None,
+        model_path: str | Path,
+        op_types_to_calibrate: Sequence[str] | None = None,
         augmented_model_path="augmented_model.onnx",
         use_external_data_format=False,
         method="distribution",
@@ -819,10 +924,10 @@ class HistogramCollector(CalibrationDataCollector):
             if isinstance(data_arr, list):
                 for arr in data_arr:
                     assert isinstance(arr, np.ndarray), f"Unexpected type {type(arr)} for tensor={tensor!r}"
-                dtypes = set(a.dtype for a in data_arr)
-                assert (
-                    len(dtypes) == 1
-                ), f"The calibration expects only one element type but got {dtypes} for tensor={tensor!r}"
+                dtypes = {a.dtype for a in data_arr}
+                assert len(dtypes) == 1, (
+                    f"The calibration expects only one element type but got {dtypes} for tensor={tensor!r}"
+                )
                 data_arr_np = np.asarray(data_arr)
             elif not isinstance(data_arr, np.ndarray):
                 raise ValueError(f"Unexpected type {type(data_arr)} for tensor={tensor!r}")
@@ -830,8 +935,8 @@ class HistogramCollector(CalibrationDataCollector):
                 data_arr_np = data_arr
             data_arr_np = data_arr_np.flatten()
             if data_arr_np.size > 0:
-                min_value = np.min(data_arr_np)
-                max_value = np.max(data_arr_np)
+                min_value = np.nanmin(data_arr_np)
+                max_value = np.nanmax(data_arr_np)
             else:
                 min_value = np.array(0, dtype=data_arr_np.dtype)
                 max_value = np.array(0, dtype=data_arr_np.dtype)
@@ -842,9 +947,9 @@ class HistogramCollector(CalibrationDataCollector):
                 # first time it uses num_bins to compute histogram.
                 hist, hist_edges = np.histogram(data_arr_np, bins=self.num_bins)
                 hist_edges = hist_edges.astype(data_arr_np.dtype)
-                assert (
-                    data_arr_np.dtype != np.float64
-                ), "only float32 or float16 is supported, every constant must be explicitly typed"
+                assert data_arr_np.dtype != np.float64, (
+                    "only float32 or float16 is supported, every constant must be explicitly typed"
+                )
                 self.histogram_dict[tensor] = (hist, hist_edges, min_value, max_value)
             else:
                 old_histogram = self.histogram_dict[tensor]
@@ -854,7 +959,7 @@ class HistogramCollector(CalibrationDataCollector):
                 assert hasattr(old_max, "dtype"), f"old_min should be a numpy array but is {type(old_max)}"
                 old_hist = old_histogram[0]
                 old_hist_edges = old_histogram[1]
-                temp_amax = np.max(data_arr_np)
+                temp_amax = np.nanmax(data_arr_np)
                 if temp_amax > old_hist_edges[-1]:
                     # increase the number of bins
                     width = old_hist_edges[1] - old_hist_edges[0]
@@ -864,9 +969,9 @@ class HistogramCollector(CalibrationDataCollector):
                 hist, hist_edges = np.histogram(data_arr_np, bins=old_hist_edges)
                 hist_edges = hist_edges.astype(data_arr_np.dtype)
                 hist[: len(old_hist)] += old_hist
-                assert (
-                    data_arr_np.dtype != np.float64
-                ), "only float32 or float16 is supported, every constant must be explicitly typed"
+                assert data_arr_np.dtype != np.float64, (
+                    "only float32 or float16 is supported, every constant must be explicitly typed"
+                )
                 self.histogram_dict[tensor] = (hist, hist_edges, min(old_min, min_value), max(old_max, max_value))
 
     def collect_value(self, name_to_arr):
@@ -878,8 +983,8 @@ class HistogramCollector(CalibrationDataCollector):
             data_arr = data_arr.flatten()  # noqa: PLW2901
 
             if data_arr.size > 0:
-                min_value = np.min(data_arr)
-                max_value = np.max(data_arr)
+                min_value = np.nanmin(data_arr)
+                max_value = np.nanmax(data_arr)
             else:
                 min_value = np.array(0, dtype=data_arr.dtype)
                 max_value = np.array(0, dtype=data_arr.dtype)
@@ -988,7 +1093,7 @@ class HistogramCollector(CalibrationDataCollector):
                 thresholds_dict[tensor] = (thresholds_dict[tensor][0], max_value)
             thresholds_dict[tensor] = (*thresholds_dict[tensor], *hist[:2])
             # Plot histogram for debug only
-            if os.environ.get("QUANTIZATION_DEBUG", 0) in (1, "1"):
+            if os.environ.get("QUANTIZATION_DEBUG", "0") in (1, "1"):
                 apply_plot(hist, hist_edges)
 
         return thresholds_dict
@@ -1009,7 +1114,7 @@ class HistogramCollector(CalibrationDataCollector):
             thresholds_dict[tensor] = (*optimal_threshold, *histogram[:2])
 
             # Plot histogram for debug only
-            if os.environ.get("QUANTIZATION_DEBUG", 0) in (1, "1"):
+            if os.environ.get("QUANTIZATION_DEBUG", "0") in (1, "1"):
                 apply_plot(histogram[0], histogram[1])
 
         return thresholds_dict
@@ -1071,7 +1176,7 @@ class HistogramCollector(CalibrationDataCollector):
             )
 
             # Plot histogram for debug only
-            if os.environ.get("QUANTIZATION_DEBUG", 0) in (1, "1"):
+            if os.environ.get("QUANTIZATION_DEBUG", "0") in (1, "1"):
                 apply_plot(hist, hist_edges)
 
         return thresholds_dict
@@ -1168,11 +1273,12 @@ class HistogramCollector(CalibrationDataCollector):
 
 
 def create_calibrator(
-    model: Union[str, Path],
-    op_types_to_calibrate: Optional[Sequence[str]] = None,
+    model: str | Path,
+    op_types_to_calibrate: Sequence[str] | None = None,
     augmented_model_path="augmented_model.onnx",
     calibrate_method=CalibrationMethod.MinMax,
     use_external_data_format=False,
+    providers=None,
     extra_options={},  # noqa: B006
 ):
     calibrator = None
@@ -1239,6 +1345,8 @@ def create_calibrator(
 
     if calibrator:
         calibrator.augment_graph()
+        if providers:
+            calibrator.execution_providers = providers
         calibrator.create_inference_session()
         return calibrator
 

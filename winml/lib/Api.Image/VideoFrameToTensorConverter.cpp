@@ -7,6 +7,7 @@
 #include <TraceLoggingProvider.h>
 #include <TraceloggingConfig.h>
 #include <evntrace.h>
+#include <limits>
 #include <MemoryBuffer.h>
 
 #include "inc/VideoFrameToTensorConverter.h"
@@ -309,7 +310,8 @@ void VideoFrameToTensorConverter::VideoFrameToDX12Tensor(
         WINML_THROW_IF_FAILED(
           spVideoFrameTexture->SetPrivateDataInterface(d3d11_texture_GUID_, spSharedD3D11Texture.Get())
         );
-        WINML_THROW_IF_FAILED(spVideoFrameTexture->SetPrivateData(handle_GUID_, sizeof(shared_handle_), &shared_handle_)
+        WINML_THROW_IF_FAILED(
+          spVideoFrameTexture->SetPrivateData(handle_GUID_, sizeof(shared_handle_), &shared_handle_)
         );
       }
 
@@ -599,9 +601,25 @@ void VideoFrameToTensorConverter::ConvertSoftwareBitmapToGPUTensor(
 
   D3D12_RESOURCE_DESC outputDesc = pOutputResource->GetDesc();
 
-  uint32_t tensorElementSize = tensorDesc.dataType == kImageTensorDataTypeFloat32 ? 4 : 2;
-  uint32_t bufferSize =
-    static_cast<uint32_t>(tensorDesc.sizes[1] * tensorDesc.sizes[2] * tensorDesc.sizes[3] * tensorElementSize);
+  const UINT64 tensorElementSize = tensorDesc.dataType == kImageTensorDataTypeFloat32 ? 4 : 2;
+  UINT64 bufferSize = tensorElementSize;
+  for (UINT index = 1; index < kImageTensorDimensionCountMax; ++index) {
+    WINML_THROW_HR_IF_FALSE_MSG(E_INVALIDARG, tensorDesc.sizes[index] > 0, "Image tensor dimensions must be positive.");
+    WINML_THROW_IF_FAILED(ULongLongMult(bufferSize, static_cast<UINT64>(tensorDesc.sizes[index]), &bufferSize));
+  }
+
+  UINT64 outputOffset = 0;
+  UINT64 outputEnd = 0;
+  WINML_THROW_IF_FAILED(ULongLongMult(bufferSize, batchIdx, &outputOffset));
+  WINML_THROW_IF_FAILED(ULongLongAdd(outputOffset, bufferSize, &outputEnd));
+  WINML_THROW_HR_IF_FALSE_MSG(
+    E_INVALIDARG,
+    outputDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && outputDesc.Height == 1 && outputDesc.Width >= outputEnd,
+    "Output tensor resource is too small for the requested image batch."
+  );
+  WINML_THROW_HR_IF_FALSE_MSG(
+    E_INVALIDARG, bufferSize <= std::numeric_limits<SIZE_T>::max(), "Image tensor upload size is too large."
+  );
 
   // TODO: Make an allocator for upload heaps
   if (!upload_heap_ || upload_heap_->GetDesc().Width < bufferSize) {
@@ -623,7 +641,7 @@ void VideoFrameToTensorConverter::ConvertSoftwareBitmapToGPUTensor(
   // instead of the initial input bounds
   ConvertSoftwareBitmapToCPUTensor(convertedSoftwareBitmap, tensorDesc, scaledBounds, pCPUTensorBuffer);
 
-  upload_heap_->Unmap(0, unmove_ptr(CD3DX12_RANGE(0, bufferSize)));
+  upload_heap_->Unmap(0, unmove_ptr(CD3DX12_RANGE(0, static_cast<SIZE_T>(bufferSize))));
 
   ResetCommandList(device_cache);
 
@@ -632,7 +650,7 @@ void VideoFrameToTensorConverter::ConvertSoftwareBitmapToGPUTensor(
   );
   command_list_->ResourceBarrier(1, &barrier);
 
-  command_list_->CopyBufferRegion(pOutputResource, bufferSize * batchIdx, upload_heap_.Get(), 0, bufferSize);
+  command_list_->CopyBufferRegion(pOutputResource, outputOffset, upload_heap_.Get(), 0, bufferSize);
 
   WINML_THROW_IF_FAILED(command_list_->Close());
   ID3D12CommandList* ppCommandLists[] = {command_list_.Get()};
@@ -814,24 +832,28 @@ void VideoFrameToTensorConverter::ConvertSoftwareBitmapToCPUTensor(
   ImageTensorChannelType channelType = _winmli::GetChannelTypeFromSoftwareBitmap(softwareBitmap);
 
   if (tensorDesc.dataType == _winml::kImageTensorDataTypeFloat32) {
-    WINML_THROW_IF_FAILED(CpuTensorizer::TensorizeData<float>(
-      channelType,
-      tensorDesc.channelType,
-      tensorDesc.pixelRange,
-      pData,
-      bufferWidth,
-      inputBounds,
-      reinterpret_cast<float*>(pCPUTensor)
-    ));
+    WINML_THROW_IF_FAILED(
+      CpuTensorizer::TensorizeData<float>(
+        channelType,
+        tensorDesc.channelType,
+        tensorDesc.pixelRange,
+        pData,
+        bufferWidth,
+        inputBounds,
+        reinterpret_cast<float*>(pCPUTensor)
+      )
+    );
   } else if (tensorDesc.dataType == _winml::kImageTensorDataTypeFloat16) {
-    WINML_THROW_IF_FAILED(CpuTensorizer::TensorizeData<DirectX::PackedVector::HALF>(
-      channelType,
-      tensorDesc.channelType,
-      tensorDesc.pixelRange,
-      pData,
-      bufferWidth,
-      inputBounds,
-      reinterpret_cast<DirectX::PackedVector::HALF*>(pCPUTensor)
-    ));
+    WINML_THROW_IF_FAILED(
+      CpuTensorizer::TensorizeData<DirectX::PackedVector::HALF>(
+        channelType,
+        tensorDesc.channelType,
+        tensorDesc.pixelRange,
+        pData,
+        bufferWidth,
+        inputBounds,
+        reinterpret_cast<DirectX::PackedVector::HALF*>(pCPUTensor)
+      )
+    );
   }
 }

@@ -405,8 +405,8 @@ export class TensorResultValidator {
           'TestRunner',
           `Tensor mismatch: \nACTUAL: type=${actual[i].type}; dims=[${actual[i].dims}]; data=[${actual[i].data}]\nEXPECT: type=${expected[i].type}; dims=[${expected[i].dims}]; data=[${expected[i].data}]`,
         );
+        throw new Error('tensor data should match');
       }
-      expect(match, 'tensor data should match').to.be.true;
     }
   }
 
@@ -586,11 +586,11 @@ export class TensorResultValidator {
   }
 }
 
-function createGpuTensorForInput(cpuTensor: ort.Tensor): ort.Tensor {
+async function createGpuTensorForInput(cpuTensor: ort.Tensor): Promise<ort.Tensor> {
   if (!isGpuBufferSupportedType(cpuTensor.type) || Array.isArray(cpuTensor.data)) {
     throw new Error(`createGpuTensorForInput can not work with ${cpuTensor.type} tensor`);
   }
-  const device = ort.env.webgpu.device as GPUDevice;
+  const device = await ort.env.webgpu.device;
   const gpuBuffer = device.createBuffer({
     // eslint-disable-next-line no-bitwise
     usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
@@ -612,14 +612,14 @@ function createGpuTensorForInput(cpuTensor: ort.Tensor): ort.Tensor {
   });
 }
 
-function createGpuTensorForOutput(type: ort.Tensor.Type, dims: readonly number[]) {
+async function createGpuTensorForOutput(type: ort.Tensor.Type, dims: readonly number[]) {
   if (!isGpuBufferSupportedType(type)) {
     throw new Error(`createGpuTensorForOutput can not work with ${type} tensor`);
   }
 
   const size = calculateTensorSizeInBytes(tensorDataTypeStringToEnum(type), dims)!;
 
-  const device = ort.env.webgpu.device as GPUDevice;
+  const device = await ort.env.webgpu.device;
   const gpuBuffer = device.createBuffer({
     // eslint-disable-next-line no-bitwise
     usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
@@ -661,7 +661,7 @@ async function createMLTensorForOutput(mlContext: MLContext, type: ort.Tensor.Ty
     shape: dims as number[],
     // Assign both shape and dimensions while transitioning to new API.
     dimensions: dims as number[],
-    usage: MLTensorUsage.READ,
+    usage: typeof MLTensorUsage == 'undefined' ? undefined : MLTensorUsage.READ,
     readable: true,
   });
 
@@ -686,7 +686,7 @@ async function createMLTensorForInput(mlContext: MLContext, cpuTensor: ort.Tenso
     shape: cpuTensor.dims as number[],
     // Assign both shape and dimensions while transitioning to new API.
     dimensions: cpuTensor.dims as number[],
-    usage: MLTensorUsage.WRITE,
+    usage: typeof MLTensorUsage == 'undefined' ? undefined : MLTensorUsage.WRITE,
     writable: true,
   });
   mlContext.writeTensor(mlTensor, cpuTensor.data);
@@ -725,7 +725,7 @@ export async function sessionRun(options: {
             if (options.ioBinding === 'ml-location' || options.ioBinding === 'ml-tensor') {
               feeds[name] = await createMLTensorForInput(options.mlContext!, feeds[name]);
             } else {
-              feeds[name] = createGpuTensorForInput(feeds[name]);
+              feeds[name] = await createGpuTensorForInput(feeds[name]);
             }
           }
         }
@@ -742,7 +742,7 @@ export async function sessionRun(options: {
             if (options.ioBinding === 'ml-tensor') {
               fetches[name] = await createMLTensorForOutput(options.mlContext!, type, dims);
             } else {
-              fetches[name] = createGpuTensorForOutput(type, dims);
+              fetches[name] = await createGpuTensorForOutput(type, dims);
             }
           }
         }
@@ -1016,8 +1016,9 @@ export class ProtoOpTestContext {
       // check if all test cases have the same shape for each inputs
       if (
         test.cases.some((testCase) =>
-          testCase.inputs!.some((input: Test.TensorValue, i) =>
-            TensorResultValidator.integerEqual(input.dims, (test.cases[0].inputs![i] as Test.TensorValue).dims),
+          testCase.inputs!.some(
+            (input: Test.TensorValue, i) =>
+              !TensorResultValidator.integerEqual(input.dims, (test.cases[0].inputs![i] as Test.TensorValue).dims),
           ),
         )
       ) {
@@ -1073,7 +1074,7 @@ export class ProtoOpTestContext {
     this.loadedData = onnx.ModelProto.encode(model).finish().slice();
 
     if (this.downloadModel) {
-      const modelFile = new File([this.loadedData], `op_test_generated_model_${test.name}.onnx`, {
+      const modelFile = new File([this.loadedData as BlobPart], `op_test_generated_model_${test.name}.onnx`, {
         type: 'application/octet-stream',
       });
       const modelTempUrl = URL.createObjectURL(modelFile);

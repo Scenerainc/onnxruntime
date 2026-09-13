@@ -58,10 +58,10 @@ void COMPUTESOFTMAXINPLACE(benchmark::State& state) {
   std::copy(data.begin(), data.end(), input);  // Copy the data to the aligned memory
 
   // warming up run
-  MlasComputeSoftmax(input, output, N, D, false, false, tp.get());
+  MlasComputeSoftmax(input, output, N, D, false, false, 0.0f, tp.get());
 
   for (auto _ : state) {
-    MlasComputeSoftmax(input, output, N, D, false, false, tp.get());
+    MlasComputeSoftmax(input, output, N, D, false, false, 0.0f, tp.get());
   }
 
   free(ptr.underlying_buffer);
@@ -178,7 +178,7 @@ void COMPUTESOFTMAXOUTPUTF32KERNELAVX(benchmark::State& state) {
 
 #endif  // defined(MLAS_TARGET_AMD64)
 
-static void ComputeSoftmaxInplaceArgs(benchmark::internal::Benchmark* b) {
+static void ComputeSoftmaxInplaceArgs(benchmark::Benchmark* b) {
   b->ArgNames({"ByteAligned", "N", "D", "Threads"});
   for (int threads : {1, 8}) {
     for (int byte_aligned : {64}) {  // MLAS_DEFAULT_PREFERRED_BUFFER_ALIGNMENT is 64

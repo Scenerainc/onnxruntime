@@ -2,7 +2,6 @@
 # Licensed under the MIT License.
 
 import copy
-from typing import Optional
 
 import onnx
 
@@ -62,7 +61,7 @@ class CrossEntropyLoss(blocks.Block):
                       contribute to the input gradient.
     """
 
-    def __init__(self, weight=None, reduction: str = "mean", ignore_index: Optional[int] = None):
+    def __init__(self, weight=None, reduction: str = "mean", ignore_index: int | None = None):
         super().__init__()
 
         if reduction not in ["mean", "sum", "none"]:
@@ -90,7 +89,7 @@ class CrossEntropyLoss(blocks.Block):
         if not _graph_utils.node_arg_exists(self.base, labels_name):
             # Create a new graph input. This is the labels input needed to compare
             # the graph output against to calculate loss.
-            labels_input = copy.deepcopy(_graph_utils.get_output_from_output_name(self.base, scores_input_name))
+            labels_input = copy.deepcopy(_graph_utils.get_value_info_for_name(self.base, scores_input_name))
             labels_input.name = labels_name
             labels_input.type.tensor_type.elem_type = onnx.TensorProto.INT64
             # Assumes classes is the last dimension
@@ -116,6 +115,16 @@ class CrossEntropyLoss(blocks.Block):
             name=_graph_utils.generate_graph_name("SoftmaxCrossEntropyLoss"),
         )
         self.base.graph.node.append(loss_node)
+
+        # Register log_prob in value_info so the gradient builder can resolve
+        # O(1) (the second output of SoftmaxCrossEntropyLoss).  Without this,
+        # graph optimizers may drop the output def and cause a C++ assertion.
+        scores_info = _graph_utils.get_value_info_for_name(self.base, scores_input_name)
+        scores_elem_type = scores_info.type.tensor_type.elem_type
+        if not any(vi.name == log_prob_output_name for vi in self.base.graph.value_info):
+            self.base.graph.value_info.append(
+                onnx.helper.make_tensor_value_info(log_prob_output_name, scores_elem_type, None)
+            )
 
         return loss_node_output_name
 
@@ -230,7 +239,7 @@ class L1Loss(blocks.Block):
         self._abs = blocks.Abs()
         self._sub = blocks.Sub()
 
-    def build(self, loss_input_name: str, target_name: Optional[str] = "target"):
+    def build(self, loss_input_name: str, target_name: str | None = "target"):
         """Adds an L1 loss subgraph on top of the base_model.
 
         Args:

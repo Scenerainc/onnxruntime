@@ -5,6 +5,8 @@
 #include "LearningModelAPITest.h"
 #include "APITest.h"
 
+#include <limits>
+
 using namespace winrt;
 using namespace winml;
 using namespace wfc;
@@ -27,7 +29,8 @@ static void CreateModelFromFilePath() {
 
 static void CreateModelFromUnicodeFilePath() {
   LearningModel learningModel = nullptr;
-  WINML_EXPECT_NO_THROW(APITest::LoadModel(L"UnicodePath\\\u3053\u3093\u306B\u3061\u306F maçã\\foo.onnx", learningModel)
+  WINML_EXPECT_NO_THROW(
+    APITest::LoadModel(L"UnicodePath\\\u3053\u3093\u306B\u3061\u306F maçã\\foo.onnx", learningModel)
   );
 }
 
@@ -242,12 +245,13 @@ static void CloseModelCheckMetadata() {
 }
 
 static void CheckLearningModelPixelRange() {
-  std::vector<std::wstring> modelPaths = {// NominalRange_0_255 and image output
-                                          L"Add_ImageNet1920WithImageMetadataBgr8_SRGB_0_255.onnx",
-                                          // Normalized_0_1 and image output
-                                          L"Add_ImageNet1920WithImageMetadataBgr8_SRGB_0_1.onnx",
-                                          // Normalized_1_1 and image output
-                                          L"Add_ImageNet1920WithImageMetadataBgr8_SRGB_1_1.onnx"
+  std::vector<std::wstring> modelPaths = {
+    // NominalRange_0_255 and image output
+    L"Add_ImageNet1920WithImageMetadataBgr8_SRGB_0_255.onnx",
+    // Normalized_0_1 and image output
+    L"Add_ImageNet1920WithImageMetadataBgr8_SRGB_0_1.onnx",
+    // Normalized_1_1 and image output
+    L"Add_ImageNet1920WithImageMetadataBgr8_SRGB_1_1.onnx"
   };
   std::vector<LearningModelPixelRange> pixelRanges = {
     LearningModelPixelRange::ZeroTo255, LearningModelPixelRange::ZeroToOne, LearningModelPixelRange::MinusOneToOne
@@ -268,6 +272,16 @@ static void CheckLearningModelPixelRange() {
       WINML_EXPECT_EQUAL(imageDescriptor.PixelRange(), pixelRanges[model_i]);
     }
   }
+}
+
+static void RejectOversizedImageDimensions() {
+  WINML_EXPECT_THROW_SPECIFIC(
+    ProtobufHelpers::CreateModel(
+      TensorKind::Float, {1, 3, static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1, 1}, 1, true
+    ),
+    winrt::hresult_error,
+    [](const winrt::hresult_error& e) -> bool { return e.code() == E_INVALIDARG; }
+  );
 }
 
 static void CloseModelCheckEval() {
@@ -296,9 +310,9 @@ static void CloseModelNoNewSessions() {
   WINML_EXPECT_NO_THROW(learningModel.Close());
   LearningModelSession session = nullptr;
   WINML_EXPECT_THROW_SPECIFIC(
-    session = LearningModelSession(learningModel),
-    winrt::hresult_error,
-    [](const winrt::hresult_error& e) -> bool { return e.code() == E_INVALIDARG; }
+    session = LearningModelSession(learningModel), winrt::hresult_error, [](const winrt::hresult_error& e) -> bool {
+      return e.code() == E_INVALIDARG;
+    }
   );
 }
 
@@ -328,6 +342,7 @@ const LearningModelApiTestsApi& getapi() {
     EnumerateOutputs,
     CloseModelCheckMetadata,
     CheckLearningModelPixelRange,
+    RejectOversizedImageDimensions,
     CloseModelCheckEval,
     CloseModelNoNewSessions,
     CheckMetadataCaseInsensitive,

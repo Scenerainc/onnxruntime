@@ -6,6 +6,7 @@
 #include <memory>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 
@@ -18,7 +19,6 @@
 #include "core/common/logging/logging.h"
 #include "core/common/profiler.h"
 #include "core/framework/allocation_planner.h"
-#include "core/framework/callback.h"
 #include "core/framework/data_transfer_manager.h"
 #include "core/framework/external_data_loader_manager.h"
 #include "core/framework/execution_providers.h"
@@ -54,6 +54,7 @@ struct SessionState;
 }  // namespace fbs
 
 class ExecutionProviders;
+class MaxShapeInferenceResult;
 class KernelDef;
 class OpKernel;
 class NodeIndexInfo;
@@ -99,12 +100,10 @@ class SessionState {
                profiling::Profiler& profiler,
                const SessionOptions& sess_options,
                PrepackedWeightsContainer* prepacked_weights_container = nullptr,
-               AllocatorMap* parent_allocators = nullptr);
+               AllocatorMap* parent_allocators = nullptr,
+               AllocatorMap* parent_initializer_allocators = nullptr);
 
   ~SessionState() {
-    for (auto& kvp : deleter_for_initialized_tensors_) {
-      kvp.second.f(kvp.second.param);
-    }
   }
 
   // Graph viewer. CreateGraphInfo must have been called previously.
@@ -131,6 +130,12 @@ class SessionState {
   /** Get the allocator for a given OrtDevice. The first allocator that matches will be returned. */
   AllocatorPtr GetAllocator(const OrtDevice& device) const noexcept;
 
+  /**
+    Get an allocator for the given OrtDevice that is only used for read-only initializers.
+    Falls back to calling GetAllocator as needed.
+   */
+  AllocatorPtr GetInitializerAllocator(const OrtDevice& device) const noexcept;
+
   /*
    * Get allocators.
    */
@@ -143,12 +148,11 @@ class SessionState {
   /**
    * Adds an initialized tensor (weight) so that it can be used by the
    * execution frame to setup the appropriate OrtValue vectors.
-   * This function will take a shallow copy of d if d is not NULL.
    * If 'constant' is true the tensor value cannot be overridden by an input at runtime.
    * If 'sparse' is true the tensor value represents a densified weight that was initially stored in the model
    * as sparse tensor.
    */
-  Status AddInitializedTensor(int ort_value_index, const OrtValue& ort_value, const OrtCallback* d, bool constant, bool sparse);
+  Status AddInitializedTensor(int ort_value_index, const OrtValue& ort_value, bool constant, bool sparse);
 
   /**
    * Gets the map of ort_value_index to initialized tensors (weights) so that it can be used by the
@@ -163,6 +167,18 @@ class SessionState {
    * The lifetime of returned OrtValues are limited by this SessionState object.
    */
   const std::unordered_map<int, OrtValue>& GetConstantInitializedTensors() const;
+
+  /**
+   * Gets the constant initialized tensors for use during kernel creation (constructor and PrePack).
+   * For subgraph session states this extends GetConstantInitializedTensors() with outer-scope
+   * constant initializers from parent graphs, re-indexed to the current subgraph's value map.
+   * This allows TryGetConstantInput to resolve parent-scope constants inside kernel constructors
+   * and PrePack (e.g. MatMulNBits packing scales alongside B when both live in the parent graph).
+   * For top-level graphs this is identical to GetConstantInitializedTensors().
+   */
+  const std::unordered_map<int, OrtValue>& GetConstantInitializedTensorsForKernelCreation() const;
+
+  const PrepackedWeightsForGraph& GetPrepackedIniitializersForGraph() const;
 
 #if !defined(DISABLE_SPARSE_TENSORS)
   bool IsSparseInitializer(int ort_value_index) const;
@@ -308,43 +324,13 @@ class SessionState {
   const InlinedHashSet<NodeIndex>* GetToBeExecutedRange(gsl::span<int const> fetch_mlvalue_idxs) const;
 #endif
 
-  std::unordered_map<std::string, std::unique_ptr<Tensor>>* GetMutableBufferedTensors() {
-    return &name_to_buffered_tensor_;
-  }
-
-  // Data structure stores prepacked initializers in format of Tensor.
-  struct PrePackInitializers {
-    // This map is used during model save for prepacked initializers.
-    // Since one constant initializer could be used by different kernels
-    // and prepacked differently, use an unordered_map to store prepacked
-    // initializer in format of <[initializer_name], <[kernel_name], [prepacked_initializer]>>
-    typedef std::unordered_map<std::string, std::unordered_map<std::string, Tensor>> PrePackedTensorsToSave;
-    PrePackedTensorsToSave pre_packed_initializers_to_save;
-
-    // This set is used during model load with prepacked initializer serialized in external data file.
-    // ORT reads prepacked initializers and store their name into this set so we could skip PrePack
-    // process later to save heap memory. Prepacked tensor itself is saved in session state's constant_initialized_tensors_.
-    typedef std::unordered_set<std::string> PrePackedTensorNamesReadFromFile;
-    PrePackedTensorNamesReadFromFile pre_packed_initializer_names_read_from_file;
-  };
-
   Status FinalizeSessionState(const std::basic_string<PATH_CHAR_TYPE>& graph_loc,
                               const KernelRegistryManager& kernel_registry_manager,
-                              PrePackInitializers& pre_packed_initializers,
                               bool remove_initializers = true,
                               bool saving_ort_format = false);
 
   SessionState* Parent() {
     return parent_;
-  }
-
-  Status FinalizeSessionState(const std::basic_string<PATH_CHAR_TYPE>& graph_loc,
-                              const KernelRegistryManager& kernel_registry_manager,
-                              bool remove_initializers = true,
-                              bool saving_ort_format = false) {
-    PrePackInitializers pre_packed_initializers;
-    return FinalizeSessionState(graph_loc, kernel_registry_manager, pre_packed_initializers,
-                                remove_initializers, saving_ort_format);
   }
 
   // Clear all removable attributes if they exists.
@@ -390,11 +376,38 @@ class SessionState {
 
   const SessionOptions& GetSessionOptions() const { return sess_options_; }
 
+  /// <summary>
+  /// Deduce the flag whether we need to enable or disable
+  /// saving for pre-packed weights serialization.
+  /// </summary>
+  /// <param name="saving_model"></param>
+  /// <param name="saving_ort_format"></param>
+  /// <returns>true of false
+  bool GetSaveModeForPrepacks(bool saving_model, bool saving_ort_format);
+
+#if !defined(ORT_MINIMAL_BUILD)
+
+  void SetNodeStatsRecorder(NodeStatsRecorder* node_stats_recorder) {
+    node_stats_recorder_ = node_stats_recorder;
+  }
+
+  /**
+   * Returns a pointer to the NodeStatsRecorder object if it was enabled for the session.
+   * The object pointer is only present at the root SessionState object
+   */
+  NodeStatsRecorder* GetNodeStatsRecorder() const {
+    if (parent_ != nullptr) {
+      return parent_->GetNodeStatsRecorder();
+    }
+    return node_stats_recorder_;
+  }
+#endif
+
  private:
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(SessionState);
 
   // Populate OrtValueNameIdxMap and create the graph viewer.
-  void CreateGraphInfo();
+  void CreateGraphInfo(bool save_prepacked_on);
 
   // create kernels using info in kernel_create_info_map_
   Status CreateKernels(const KernelRegistryManager& custom_registry_manager);
@@ -403,16 +416,16 @@ class SessionState {
   // (replaced byOrtValue instances in initialized_tensors_)
   void CleanInitializedTensorsFromGraph();
 
+#ifdef ORT_ENABLE_STREAM
+  void PruneExpiredDeviceStreamPoolsLocked() const;
+#endif
+
   /**
    * Prepack the constant initialized tensors for better performance.
    * The original constant initialized tensors will be removed to save memory.
-   * For model with prepacked initializer serialized into ONNX data file,
-   * PrePack will be skipped to save memory.
    */
   Status PrepackConstantInitializedTensors(InlinedHashMap<std::string, size_t>& constant_initializers_use_count,
-                                           const std::unordered_map<std::string, const OrtValue*>& initializers_to_share_map,
-                                           bool save_prepacked_constant_initializers,
-                                           PrePackInitializers& pre_packed_initializers);
+                                           const std::unordered_map<std::string, const OrtValue*>& initializers_to_share_map);
 
   SessionState* GetMutableSubgraphSessionState(onnxruntime::NodeIndex index, const std::string& attribute_name);
 
@@ -429,8 +442,9 @@ class SessionState {
                                   _In_opt_ const Node* parent_node,
                                   const SessionOptions& session_options,
                                   bool remove_initializers,
+                                  bool save_prepacked_initializers,
                                   InlinedHashMap<std::string, size_t>& constant_initializers_use_count,
-                                  PrePackInitializers& pre_packed_initializers,
+                                  const MaxShapeInferenceResult& max_shape_inference_result,
                                   const InlinedHashMap<OrtValueName, OrtDevice>& outer_scope_node_arg_to_location_map = {},
                                   bool graph_info_already_created = false);
 
@@ -462,36 +476,30 @@ class SessionState {
     bool operator()(const OrtMemoryInfo& lhs, const OrtMemoryInfo& rhs) const {
       // if (lhs.alloc_type != rhs.alloc_type)
       //   return lhs.alloc_type < rhs.alloc_type;
-      if (lhs.mem_type != rhs.mem_type)
+      if (lhs.mem_type != rhs.mem_type) {
         return lhs.mem_type < rhs.mem_type;
-
-      if (lhs.id != rhs.id)
-        return lhs.id < rhs.id;
+      }
 
       if (lhs.device != rhs.device) {
-        // id should always == device.id so ignore that
-        if (lhs.device.Type() != rhs.device.Type())
-          return lhs.device.Type() < rhs.device.Type();
-
-        // this is the allocator mem type and not the kernel mem type that OrtMemoryInfo.mem_type represents
-        return lhs.device.MemType() < rhs.device.MemType();
+        return lhs.device < rhs.device;
       }
 
       return false;
     }
   };
 
-  // using std::map as OrtDevice would need a custom hash function to be used with std::unordered_map,
-  // and as this isn't considered performance critical currently it's not worth the maintenance overhead of adding one.
-  // We do get an allocator from ExecutionFrame so this is looked up frequently, however there most likely aren't many
-  // entries in the map
   // SessionState will contain other SessionState objects for subgraph. The unique ptr will be initialized only the
   // SessionState object is in the parent graph, the raw pointer will be initialized when session state is in parent
   // graph (from the unique ptr) or in the subgraph (from the raw pointer from parent session state). The raw pointer
   // will be used all the way to access std::map<OrtDevice, AllocatorPtr>, unique pointer is only releasing the resource
   // when the parent session state is releasing.
   std::unique_ptr<AllocatorMap> allocators_unique_ptr_;
+  // allocators with type of OrtAllocatorType::OrtReadOnlyAllocator that are used for initializers if found.
+  // if not we fallback to lookup in allocators_;
+  std::unique_ptr<AllocatorMap> initializer_allocators_unique_ptr_;
+
   AllocatorMap* allocators_;
+  AllocatorMap* initializer_allocators_;
 
   OrtValueNameIdxMap ort_value_name_idx_map_;
 
@@ -499,6 +507,20 @@ class SessionState {
   std::unordered_map<int, OrtValue> initialized_tensors_;  // key is ort_value_index
   // subset of initialized_tensors_ that are constant and cannot be overridden at runtime
   std::unordered_map<int, OrtValue> constant_initialized_tensors_;
+  // For subgraph session states: constant_initialized_tensors_ extended with outer-scope constant
+  // initializers (from parent graphs) re-indexed to this subgraph's ort_value_name_idx_map_.
+  // Populated in FinalizeSessionStateImpl before CreateKernels; empty for top-level graphs.
+  // Returned by GetConstantInitializedTensorsForKernelCreation() so kernel constructors and
+  // PrePack can resolve parent-graph constants via TryGetConstantInput.
+  // After the subgraph finalization loop, the parent-scope copies in this map are erased
+  // (tracked via outer_scope_parent_only_indices_) to allow parent memory to be freed once
+  // prepack use counts reach zero.
+  std::unordered_map<int, OrtValue> outer_scope_augmented_constant_tensors_;
+  // Indices in outer_scope_augmented_constant_tensors_ that were added from parent scope
+  // (not present in constant_initialized_tensors_).  Erased from the augmented map after
+  // all subgraphs are finalized to release the extra OrtValue refcounts.
+  std::unordered_set<int> outer_scope_parent_only_indices_;
+  bool outer_scope_augmented_map_built_{false};
 
 #if !defined(DISABLE_SPARSE_TENSORS)
   // This is an auxiliary lookup to check if the OrtValue was actually a sparse tensor
@@ -510,7 +532,6 @@ class SessionState {
 
   // This data structure is for uninitializing string tensors and
   // munmap memory region and close file descriptor
-  InlinedHashMap<int, OrtCallback> deleter_for_initialized_tensors_;
   InlinedVector<BufferUniquePtr> weights_buffers_;
   std::optional<SequentialExecutionPlan> p_seq_exec_plan_;
 
@@ -519,6 +540,10 @@ class SessionState {
 
 #if !defined(ORT_MINIMAL_BUILD) && defined(ORT_MEMORY_PROFILE)
   MemoryProfiler* memory_profiler_;
+#endif
+
+#if !defined(ORT_MINIMAL_BUILD)
+  NodeStatsRecorder* node_stats_recorder_ = nullptr;
 #endif
 
   // switch for enable memory pattern optimization or not.
@@ -598,18 +623,18 @@ class SessionState {
 #ifdef ORT_ENABLE_STREAM
   std::unique_ptr<IStreamCommandHandleRegistry> stream_handles_registry_;
 
-  // lock for the device stream pool
+  struct DeviceStreamPoolBucket {
+    std::weak_ptr<const void> thread_token;
+    std::vector<std::unique_ptr<DeviceStreamCollection>> device_streams;
+  };
+
+  // Lock for thread-affine device stream pools keyed by a per-thread lifetime
+  // token. Buckets for exited threads are pruned lazily on acquire/recycle.
   mutable std::mutex device_stream_pool_mutex_;
-  mutable std::vector<std::unique_ptr<DeviceStreamCollection>> device_stream_pool_;
+  mutable InlinedHashMap<const void*, DeviceStreamPoolBucket> device_stream_pools_;
   // flag to indicate whether current session using any EP that create device stream dynamically.
   bool has_device_stream_enabled_ep_ = false;
 #endif
-
-  // Holds the tensors which provide memory buffer for TensorProtos
-  // Use case: in optimizer, transform a TensorProto to a new TensorProto whose the memory buffer is
-  // allocated by CPU instead by protobuf's arena. Arena style memory allocators do not fully release
-  // a instance's memory which may result large memory consumption, which is a tradeoff for speed.
-  std::unordered_map<std::string, std::unique_ptr<Tensor>> name_to_buffered_tensor_;
 };
 
 }  // namespace onnxruntime

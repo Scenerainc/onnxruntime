@@ -22,9 +22,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Union
 
-import coloredlogs
 from fusion_options import FusionOptions
 from onnx import ModelProto, load_model
 from onnx_model import OnnxModel
@@ -35,6 +33,7 @@ from onnx_model_bert_tf import BertOnnxModelTF
 from onnx_model_clip import ClipOnnxModel
 from onnx_model_conformer import ConformerOnnxModel
 from onnx_model_gpt2 import Gpt2OnnxModel
+from onnx_model_mmdit import MmditOnnxModel
 from onnx_model_phi import PhiOnnxModel
 from onnx_model_sam2 import Sam2OnnxModel
 from onnx_model_t5 import T5OnnxModel
@@ -59,6 +58,7 @@ MODEL_TYPES = {
     "gpt2_tf": (Gpt2OnnxModel, "tf2onnx", 0),  # might add a class for GPT2OnnxModel for TF later.
     "gpt_neox": (BertOnnxModel, "pytorch", 0),  # GPT-NeoX
     "phi": (PhiOnnxModel, "pytorch", 0),
+    "qwen3": (Gpt2OnnxModel, "pytorch", 0),  # Qwen3 (decoder-only with RoPE, GQA, RMSNorm)
     "sam2": (Sam2OnnxModel, "pytorch", 1),
     "swin": (BertOnnxModel, "pytorch", 1),
     "tnlr": (TnlrOnnxModel, "pytorch", 1),
@@ -66,21 +66,22 @@ MODEL_TYPES = {
     "unet": (UnetOnnxModel, "pytorch", 1),  # UNet in Stable Diffusion
     "vae": (VaeOnnxModel, "pytorch", 1),  # UAE in Stable Diffusion
     "vit": (BertOnnxModel, "pytorch", 1),
+    "mmdit": (MmditOnnxModel, "pytorch", 1),
 }
 
 
 def optimize_by_onnxruntime(
-    onnx_model: Optional[Union[str, ModelProto]] = None,
+    onnx_model: str | ModelProto | None = None,
     use_gpu: bool = False,
-    optimized_model_path: Optional[str] = None,
-    opt_level: Optional[int] = 99,
-    disabled_optimizers: List[str] = [],  # noqa: B006
+    optimized_model_path: str | None = None,
+    opt_level: int | None = 99,
+    disabled_optimizers: list[str] = [],  # noqa: B006
     verbose: bool = False,
     save_as_external_data: bool = False,
     external_data_filename: str = "",
     external_data_file_threshold: int = 1024,
     *,
-    provider: Optional[str] = None,
+    provider: str | None = None,
     **deprecated_kwargs,
 ) -> str:
     """
@@ -100,7 +101,7 @@ def optimize_by_onnxruntime(
         optimized_model_path (str): the path of optimized model
     """
     assert opt_level in [1, 2, 99]
-    from torch import version as torch_version
+    from torch import version as torch_version  # noqa: PLC0415
 
     if onnx_model is None:
         onnx_model = deprecated_kwargs.pop("onnx_model_path", None)
@@ -110,7 +111,7 @@ def optimize_by_onnxruntime(
         use_gpu
         and provider is None
         and set(onnxruntime.get_available_providers()).isdisjoint(
-            ["CUDAExecutionProvider", "ROCMExecutionProvider", "MIGraphXExecutionProvider"]
+            ["CUDAExecutionProvider", "MIGraphXExecutionProvider"]
         )
     ):
         logger.error("There is no gpu for onnxruntime to do optimization.")
@@ -134,6 +135,8 @@ def optimize_by_onnxruntime(
         sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_BASIC
     elif opt_level == 2:
         sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    elif opt_level == 3:
+        sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_LAYOUT
     else:
         sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
 
@@ -169,10 +172,8 @@ def optimize_by_onnxruntime(
     elif provider is not None:
         if provider == "dml":
             providers = ["DmlExecutionProvider"]
-        elif provider == "rocm":
-            providers = ["ROCMExecutionProvider"]
         elif provider == "migraphx":
-            providers = ["MIGraphXExecutionProvider", "ROCMExecutionProvider"]
+            providers = ["MIGraphXExecutionProvider"]
         elif provider == "cuda":
             providers = ["CUDAExecutionProvider"]
         elif provider == "tensorrt":
@@ -186,7 +187,6 @@ def optimize_by_onnxruntime(
 
         if torch_version.hip:
             providers.append("MIGraphXExecutionProvider")
-            providers.append("ROCMExecutionProvider")
         else:
             providers.append("CUDAExecutionProvider")
 
@@ -215,7 +215,7 @@ def optimize_by_fusion(
     model_type: str = "bert",
     num_heads: int = 0,
     hidden_size: int = 0,
-    optimization_options: Optional[FusionOptions] = None,
+    optimization_options: FusionOptions | None = None,
 ) -> OnnxModel:
     """Optimize Model by graph fusion logic.
 
@@ -237,7 +237,9 @@ def optimize_by_fusion(
      Returns:
         object of an optimizer class.
     """
-    if model_type not in ["bert", "swin", "unet", "vae", "clip", "sam2"] and (num_heads == 0 or hidden_size == 0):
+    if model_type not in ["bert", "t5", "swin", "unet", "vae", "clip", "sam2", "mmdit"] and (
+        num_heads == 0 or hidden_size == 0
+    ):
         logger.warning(f"Please specify parameters of num_heads and hidden_size for model_type {model_type}")
 
     if model_type not in MODEL_TYPES:
@@ -262,7 +264,7 @@ def optimize_by_fusion(
     optimizer.topological_sort()
 
     optimizer.model.producer_name = "onnxruntime.transformers"
-    from onnxruntime import __version__ as onnxruntime_version
+    from onnxruntime import __version__ as onnxruntime_version  # noqa: PLC0415
 
     optimizer.model.producer_version = onnxruntime_version
 
@@ -270,17 +272,17 @@ def optimize_by_fusion(
 
 
 def optimize_model(
-    input: Union[str, ModelProto],
+    input: str | ModelProto,
     model_type: str = "bert",
     num_heads: int = 0,
     hidden_size: int = 0,
-    optimization_options: Optional[FusionOptions] = None,
-    opt_level: Optional[int] = None,
+    optimization_options: FusionOptions | None = None,
+    opt_level: int | None = None,
     use_gpu: bool = False,
     only_onnxruntime: bool = False,
     verbose: bool = False,
     *,
-    provider: Optional[str] = None,
+    provider: str | None = None,
 ) -> OnnxModel:
     """Optimize Model by OnnxRuntime and/or python fusion logic.
 
@@ -410,7 +412,7 @@ def optimize_model(
     return optimizer
 
 
-def get_fusion_statistics(optimized_model_path: str) -> Dict[str, int]:
+def get_fusion_statistics(optimized_model_path: str) -> dict[str, int]:
     """
     Get counter of fused operators in optimized model.
 
@@ -514,11 +516,11 @@ def _parse_arguments():
         "--opt_level",
         required=False,
         type=int,
-        choices=[0, 1, 2, 99],
+        choices=[0, 1, 2, 3, 99],
         default=None,
         help="onnxruntime optimization level. 0 will disable onnxruntime graph optimization. "
         "The recommended value is 1. When opt_level > 1 is used, optimized model for GPU might not run in CPU. "
-        "Level 2 and 99 are intended for --only_onnxruntime.",
+        "Level 2, Level 3 and 99 are intended for --only_onnxruntime.",
     )
 
     parser.add_argument(
@@ -533,7 +535,7 @@ def _parse_arguments():
         "--disable_symbolic_shape_infer",
         required=False,
         action="store_true",
-        help="diable symbolic shape inference",
+        help="disable symbolic shape inference",
     )
     parser.set_defaults(disable_symbolic_shape_infer=False)
 
@@ -545,6 +547,14 @@ def _parse_arguments():
     )
     parser.set_defaults(convert_to_packing_mode=False)
 
+    parser.add_argument(
+        "--convert_attribute",
+        required=False,
+        action="store_true",
+        help="convert attributes when using a rewritten ONNX model (e.g. Dynamo-exported model from ONNX Script)",
+    )
+    parser.set_defaults(convert_attribute=False)
+
     args = parser.parse_args()
 
     return args
@@ -552,12 +562,11 @@ def _parse_arguments():
 
 def _setup_logger(verbose):
     if verbose:
-        coloredlogs.install(
-            level="DEBUG",
-            fmt="[%(filename)s:%(lineno)s - %(funcName)20s()] %(message)s",
+        logging.basicConfig(
+            format="[%(filename)s:%(lineno)s - %(funcName)20s()] %(message)s", level=logging.DEBUG, force=True
         )
     else:
-        coloredlogs.install(fmt="%(funcName)20s: %(message)s")
+        logging.basicConfig(format="%(funcName)20s: %(message)s", level=logging.INFO, force=True)
 
 
 def main():
@@ -605,7 +614,7 @@ def main():
         else:
             logger.warning("Packing mode only supports BERT like models")
 
-    optimizer.save_model_to_file(args.output, args.use_external_data_format)
+    optimizer.save_model_to_file(args.output, args.use_external_data_format, convert_attribute=args.convert_attribute)
 
 
 if __name__ == "__main__":

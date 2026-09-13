@@ -1,8 +1,7 @@
 set(XNNPACK_USE_SYSTEM_LIBS ON CACHE INTERNAL "")
 set(XNNPACK_BUILD_TESTS OFF CACHE INTERNAL "")
 set(XNNPACK_BUILD_BENCHMARKS OFF CACHE INTERNAL "")
-set(FP16_BUILD_TESTS OFF CACHE INTERNAL "")
-set(FP16_BUILD_BENCHMARKS OFF CACHE INTERNAL "")
+
 set(PTHREADPOOL_BUILD_TESTS OFF CACHE INTERNAL "")
 set(PTHREADPOOL_BUILD_BENCHMARKS OFF CACHE INTERNAL "")
 set(KLEIDIAI_BUILD_TESTS OFF CACHE INTERNAL "")
@@ -17,50 +16,12 @@ if(CMAKE_ANDROID_ARCH_ABI STREQUAL armeabi-v7a)
   set(XNNPACK_ENABLE_ARM_BF16 OFF)
 endif()
 
-# fp16 depends on psimd
-FetchContent_Declare(psimd URL ${DEP_URL_psimd} URL_HASH SHA1=${DEP_SHA1_psimd})
-onnxruntime_fetchcontent_makeavailable(psimd)
-set(PSIMD_SOURCE_DIR ${psimd_SOURCE_DIR})
-
-block(PROPAGATE fp16_PATCH_COMMAND)
-  # only apply fp16 patch for Apple x86_64 targets
-
-  if(APPLE)
-    if(NOT "${CMAKE_OSX_ARCHITECTURES}" STREQUAL "")
-      if ("x86_64" IN_LIST CMAKE_OSX_ARCHITECTURES)
-        set(fp16_PATCH_REQUIRED 1)
-      endif()
-    else()
-      # CMAKE_OSX_ARCHITECTURES unspecified, check host
-      if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
-        set(fp16_PATCH_REQUIRED 1)
-      endif()
-    endif()
-  endif()
-
-  if(fp16_PATCH_REQUIRED)
-    message(STATUS "Applying fp16 patch.")
-    set(fp16_PATCH_FILE ${PROJECT_SOURCE_DIR}/patches/fp16/remove_math_h_dependency_from_fp16_h.patch)
-    set(fp16_PATCH_COMMAND ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 < ${fp16_PATCH_FILE})
-  else()
-    set(fp16_PATCH_COMMAND "")
-  endif()
-endblock()
-
-FetchContent_Declare(
-    fp16
-    URL ${DEP_URL_fp16}
-    URL_HASH SHA1=${DEP_SHA1_fp16}
-    PATCH_COMMAND ${fp16_PATCH_COMMAND}
-    )
-onnxruntime_fetchcontent_makeavailable(fp16)
-
 # pthreadpool depends on fxdiv
-FetchContent_Declare(fxdiv URL ${DEP_URL_fxdiv} URL_HASH SHA1=${DEP_SHA1_fxdiv})
+onnxruntime_fetchcontent_declare(fxdiv URL ${DEP_URL_fxdiv} URL_HASH SHA1=${DEP_SHA1_fxdiv} EXCLUDE_FROM_ALL FIND_PACKAGE_ARGS NAMES fxdiv)
 onnxruntime_fetchcontent_makeavailable(fxdiv)
 set(FXDIV_SOURCE_DIR ${fxdiv_SOURCE_DIR})
 
-FetchContent_Declare(pthreadpool URL ${DEP_URL_pthreadpool} URL_HASH SHA1=${DEP_SHA1_pthreadpool})
+onnxruntime_fetchcontent_declare(pthreadpool URL ${DEP_URL_pthreadpool} URL_HASH SHA1=${DEP_SHA1_pthreadpool} EXCLUDE_FROM_ALL FIND_PACKAGE_ARGS NAMES unofficial-pthreadpool)
 onnxruntime_fetchcontent_makeavailable(pthreadpool)
 
 # ---  Determine target processor
@@ -101,6 +62,8 @@ ELSEIF(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
   SET(ORT_TARGET_PROCESSOR "arm64")
 ELSEIF(CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64le")
   SET(ORT_TARGET_PROCESSOR "ppc64")
+ELSEIF(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  SET(ORT_TARGET_PROCESSOR "wasm")
 ELSEIF(NOT ORT_TARGET_PROCESSOR MATCHES "^(x86(_64)?|arm64|riscv(32|64|128)|Hexagon|ppc64)$")
   SET(ORT_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
 ELSE()
@@ -114,22 +77,27 @@ if(ORT_TARGET_PROCESSOR MATCHES "^arm64.*" AND NOT CMAKE_C_COMPILER_ID STREQUAL 
   # kleidiAI use CMAKE_SYSTEM_PROCESSOR to determine whether includes aarch64/arm64 ukernels
   # https://gitlab.arm.com/kleidi/kleidiai/-/blob/main/CMakeLists.txt#L134
   set(CMAKE_SYSTEM_PROCESSOR arm64)
-  FetchContent_Declare(kleidiai URL ${DEP_URL_kleidiai} URL_HASH SHA1=${DEP_SHA1_kleidiai})
+  onnxruntime_fetchcontent_declare(kleidiai URL ${DEP_URL_kleidiai} URL_HASH SHA1=${DEP_SHA1_kleidiai} EXCLUDE_FROM_ALL)
   onnxruntime_fetchcontent_makeavailable(kleidiai)
   set(KLEIDIAI_SOURCE_DIR ${kleidiai_SOURCE_DIR})
 endif()
 
 
-FetchContent_Declare(googlexnnpack URL ${DEP_URL_googlexnnpack} URL_HASH SHA1=${DEP_SHA1_googlexnnpack}
-                     PATCH_COMMAND ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 < ${PROJECT_SOURCE_DIR}/patches/xnnpack/AddEmscriptenAndIosSupport.patch
+onnxruntime_fetchcontent_declare(googlexnnpack URL ${DEP_URL_googlexnnpack} URL_HASH SHA1=${DEP_SHA1_googlexnnpack}
+                     PATCH_COMMAND ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 < ${PROJECT_SOURCE_DIR}/patches/xnnpack/AddEmscriptenAndIosSupport.patch &&
+                                   ${Patch_EXECUTABLE} --ignore-whitespace -p1 < ${PROJECT_SOURCE_DIR}/patches/xnnpack/release_cpuinfo_after_hardware_config.patch
+		     EXCLUDE_FROM_ALL
                     )
 onnxruntime_fetchcontent_makeavailable(googlexnnpack)
 set(XNNPACK_DIR ${googlexnnpack_SOURCE_DIR})
 set(XNNPACK_INCLUDE_DIR ${XNNPACK_DIR}/include)
 
-set(onnxruntime_EXTERNAL_LIBRARIES_XNNPACK XNNPACK microkernels-prod pthreadpool)
+set(onnxruntime_EXTERNAL_LIBRARIES_XNNPACK XNNPACK pthreadpool)
 if(ORT_TARGET_PROCESSOR MATCHES "^arm64.*" AND NOT CMAKE_C_COMPILER_ID STREQUAL "MSVC")
   list(APPEND onnxruntime_EXTERNAL_LIBRARIES_XNNPACK kleidiai)
+endif()
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  list(APPEND onnxruntime_EXTERNAL_LIBRARIES_XNNPACK xnnpack-microkernels-prod)
 endif()
 
 # the XNNPACK CMake setup doesn't include the WASM kernels so we have to manually set those up
@@ -138,7 +106,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   message("Adding WebAssembly Source Files to XNNPACK")
   set(wasm_srcs "")
 
-  file(READ "${XNNPACK_DIR}/BUILD.bazel" xnnpack_bazel_config)
+  file(READ "${XNNPACK_DIR}/build_srcs.bzl" xnnpack_bazel_config)
 
   # Replace newlines with semicolon so that it is treated as a list by CMake
   # Also replace '[' and ']' so the bazel source lists don't get parsed as a nested list by cmake
@@ -176,14 +144,26 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   GetSrcListFromBazel("TABLE_SRCS" table_srcs)
   list(APPEND wasm_srcs ${operator_srcs} ${table_srcs})
 
-  # kernels
-  list(APPEND wasm_srcs ${XNNPACK_DIR}/src/amalgam/gen/scalar.c)
-  list(APPEND wasm_srcs ${XNNPACK_DIR}/src/amalgam/gen/wasm.c)
+  set(microkernel_src "")
 
-  if(onnxruntime_ENABLE_WEBASSEMBLY_SIMD)
-    list(APPEND wasm_srcs ${XNNPACK_DIR}/src/amalgam/gen/wasmsimd.c)
+  include(${XNNPACK_DIR}/cmake/gen/scalar_microkernels.cmake)
+  list(APPEND microkernel_src ${PROD_SCALAR_MICROKERNEL_SRCS})
+  list(APPEND microkernel_src ${PROD_WASM_MICROKERNEL_SRCS})
+
+  if(onnxruntime_ENABLE_WEBASSEMBLY_RELAXED_SIMD)
+    include(${XNNPACK_DIR}/cmake/gen/wasmsimd_microkernels.cmake)
+    include(${XNNPACK_DIR}/cmake/gen/wasmrelaxedsimd_microkernels.cmake)
+    list(APPEND microkernel_src ${PROD_WASMSIMD_MICROKERNEL_SRCS})
+    list(APPEND microkernel_src ${PROD_WASMRELAXEDSIMD_MICROKERNEL_SRCS})
+    target_compile_options(XNNPACK PRIVATE "-msimd128")
+    target_compile_options(XNNPACK PRIVATE "-mrelaxed-simd")
+  elseif(onnxruntime_ENABLE_WEBASSEMBLY_SIMD)
+    include(${XNNPACK_DIR}/cmake/gen/wasmsimd_microkernels.cmake)
+    list(APPEND microkernel_src ${PROD_WASMSIMD_MICROKERNEL_SRCS})
     target_compile_options(XNNPACK PRIVATE "-msimd128")
   endif()
+  list(TRANSFORM microkernel_src PREPEND "${XNNPACK_DIR}/")
+  list(APPEND wasm_srcs ${microkernel_src})
 
   message(DEBUG "wasm_srcs: ${wasm_srcs}\n")
   target_sources(XNNPACK PRIVATE ${wasm_srcs})

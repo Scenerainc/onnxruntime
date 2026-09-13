@@ -15,7 +15,9 @@
 #endif
 
 namespace onnxruntime {
-
+namespace logging {
+class Logger;
+}
 class GraphViewer;
 class Node;
 
@@ -29,9 +31,11 @@ struct OpVersionsAndSelector {
   using OpVersionsMap = std::unordered_map<std::string, std::vector<ONNX_NAMESPACE::OperatorSetVersion>>;
 
   OpVersionsAndSelector(const OpVersionsMap& ops_and_versions_in,
-                        std::unique_ptr<NodeGroupSelector> selector_in)
-      : op_versions_map{ops_and_versions_in},
-        selector{std::move(selector_in)} {}
+                        std::unique_ptr<NodeGroupSelector> selector_in);
+
+  // Destructor defined out-of-line so NodeGroupSelector is complete when
+  // unique_ptr<NodeGroupSelector> is destroyed (required by libc++).
+  ~OpVersionsAndSelector();
 
   OpVersionsMap op_versions_map;
   std::unique_ptr<NodeGroupSelector> selector;
@@ -42,7 +46,11 @@ struct OpVersionsAndSelector {
 // class that manages a set of node group selectors
 class Selectors {
  public:
-  Selectors() = default;
+  // Constructor/destructor defined out-of-line so NodeGroupSelector is
+  // complete when unique_ptr<NodeGroupSelector> is destroyed (required
+  // by libc++, which checks completeness at the point of the destructor).
+  Selectors();
+  ~Selectors();
 
   // register a selector for the specified ops.
   void RegisterSelector(const OpVersionsAndSelector::OpVersionsMap& ops_and_versions_in,
@@ -62,10 +70,11 @@ class Selectors {
 class SelectorManager {
  public:
   SelectorManager();
+  ~SelectorManager();
 
   // Methods that finds and returns a vector of QDQ::NodeGroup in a given graph
   // Can be used in QDQ support in different EPs
-  std::vector<NodeGroup> GetQDQSelections(const GraphViewer& graph_viewer) const;
+  std::vector<NodeGroup> GetQDQSelections(const GraphViewer& graph_viewer, const logging::Logger& logger) const;
 
  private:
   Selectors qdq_selectors_;
@@ -88,7 +97,7 @@ class SelectorManager {
 // We currently have a bit of a mess with generic things like this to get all the node units being in the optimizer
 // library whereas it should be able to be used by an EP with no dependency on optimizers.
 std::pair<std::vector<std::unique_ptr<NodeUnit>>, std::unordered_map<const Node*, const NodeUnit*>>
-GetAllNodeUnits(const GraphViewer& graph_viewer);
+GetAllNodeUnits(const GraphViewer& graph_viewer, const logging::Logger& logger);
 
 }  // namespace QDQ
 }  // namespace onnxruntime

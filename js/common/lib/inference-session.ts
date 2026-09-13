@@ -4,6 +4,8 @@
 import { InferenceSession as InferenceSessionImpl } from './inference-session-impl.js';
 import { OnnxModelOptions } from './onnx-model.js';
 import { OnnxValue, OnnxValueDataLocation } from './onnx-value.js';
+import type { Tensor } from './tensor.js';
+import { TryGetGlobalType } from './type-helper.js';
 
 /* eslint-disable @typescript-eslint/no-redeclare */
 
@@ -25,7 +27,7 @@ export declare namespace InferenceSession {
    * - An array of string indicating the output names.
    * - An object that use output names as keys and OnnxValue or null as corresponding values.
    *
-   * @remark
+   * @remarks
    * different from input argument, in output, OnnxValue is optional. If an OnnxValue is present it will be
    * used as a pre-allocated value by the inference engine; if omitted, inference engine will allocate buffer
    * internally.
@@ -79,7 +81,7 @@ export declare namespace InferenceSession {
      *
      * This setting is available only in ONNXRuntime (Node.js binding and react-native) or WebAssembly backend
      */
-    graphOptimizationLevel?: 'disabled' | 'basic' | 'extended' | 'all';
+    graphOptimizationLevel?: 'disabled' | 'basic' | 'extended' | 'layout' | 'all';
 
     /**
      * Whether enable CPU memory arena.
@@ -243,7 +245,116 @@ export declare namespace InferenceSession {
   }
   export interface WebGpuExecutionProviderOption extends ExecutionProviderOption {
     readonly name: 'webgpu';
+
+    /**
+     * Specify the preferred layout when running layout sensitive operators.
+     *
+     * @default 'NCHW'
+     */
     preferredLayout?: 'NCHW' | 'NHWC';
+
+    /**
+     * Specify a list of node names that should be executed on CPU even when WebGPU EP is used.
+     */
+    forceCpuNodeNames?: readonly string[];
+
+    /**
+     * Specify the validation mode for WebGPU execution provider.
+     * - 'disabled': Disable all validation.
+     * When used in Node.js, disable validation may cause process crash if WebGPU errors occur. Be cautious when using
+     * this mode.
+     * When used in web, this mode is equivalent to 'wgpuOnly'.
+     * - 'wgpuOnly': Perform WebGPU internal validation only.
+     * - 'basic': Perform basic validation including WebGPU internal validation. This is the default mode.
+     * - 'full': Perform full validation. This mode may have performance impact. Use it for debugging purpose.
+     *
+     * @default 'basic'
+     */
+    validationMode?: 'disabled' | 'wgpuOnly' | 'basic' | 'full';
+
+    /**
+     * Enable robust buffer access for an ORT-created Dawn device. This is a global, first-device-wins option. Later
+     * conflicting values and values supplied with an external device are ignored with a warning.
+     *
+     * This setting is available only in ONNX Runtime (Node.js binding).
+     *
+     * @default `true` in Debug builds; `false` in Release and RelWithDebInfo builds
+     */
+    enableRobustness?: boolean;
+
+    /**
+     * Specify the cache mode for storage buffers.
+     * - 'disabled': Disable buffer cache. Buffers are destroyed when no longer in use.
+     * - 'lazyRelease': Buffers are released lazily, at the end of the current run.
+     * - 'simple': Released buffers are cached and reused only for requests of the exact same size.
+     * - 'bucket': Released buffers are cached and reused using predefined size buckets. This is the default mode.
+     *
+     * For static-shape models, 'simple' may reduce GPU memory usage, because exact-size buffers are reused across
+     * runs instead of allocating new bucket-sized buffers.
+     *
+     * @default 'bucket'
+     */
+    storageBufferCacheMode?: 'disabled' | 'lazyRelease' | 'simple' | 'bucket';
+
+    /**
+     * Specify the cache mode for uniform buffers.
+     *
+     * See {@link storageBufferCacheMode} for a description of the available modes.
+     *
+     * @default 'simple'
+     */
+    uniformBufferCacheMode?: 'disabled' | 'lazyRelease' | 'simple' | 'bucket';
+
+    /**
+     * Specify the cache mode for query resolve buffers.
+     *
+     * See {@link storageBufferCacheMode} for a description of the available modes.
+     *
+     * @default 'disabled'
+     */
+    queryResolveBufferCacheMode?: 'disabled' | 'lazyRelease' | 'simple' | 'bucket';
+
+    /**
+     * Specify the cache mode for buffers not covered by the other buffer cache mode options.
+     *
+     * See {@link storageBufferCacheMode} for a description of the available modes.
+     *
+     * @default 'disabled'
+     */
+    defaultBufferCacheMode?: 'disabled' | 'lazyRelease' | 'simple' | 'bucket';
+
+    /**
+     * Accumulate the dot products in f32 instead of in the output element type. The input and
+     * weight tensors keep their own type, so global memory traffic is identical either way.
+     *
+     * When this is false the accumulator follows the output element type. Partial sums along K
+     * can exceed the f16 maximum (65504) on backends that round strictly at every step, which
+     * saturates the accumulator to Inf; setting this avoids that at the cost of registers and
+     * workgroup memory.
+     *
+     * Where a fused kernel computes its epilogue on the accumulators, that epilogue carries the
+     * wider type too. On the fused MLP decode fast path the bias, the SiLU and the gate/up product
+     * are applied to the f32 accumulators and rounded once at the final store rather than after
+     * every step, so with the option on its output can differ from the same graph run unfused by
+     * more than the accumulation change alone. Fused MLP shapes that do not take that fast path
+     * materialize the gate and up tensors in the output element type before the activation, and
+     * are unaffected in their epilogue.
+     *
+     * This currently applies to MatMulNBits and its fused variants. Coverage of the unquantized
+     * MatMul family is planned as follow-up work under the same option.
+     *
+     * This option is read by the native WebGPU execution provider only. Builds of onnxruntime-web
+     * that use the JSEP WebGPU backend ignore it, and their MatMulNBits shaders keep accumulating
+     * in the output element type.
+     *
+     * @default false
+     */
+    enableMatmulFp32Accumulation?: boolean;
+
+    /**
+     * Specify an optional WebGPU device to be used by the WebGPU execution provider.
+     */
+    device?: TryGetGlobalType<'GPUDevice'>;
   }
 
   // #region WebNN options
@@ -279,10 +390,11 @@ export declare namespace InferenceSession {
    * @see https://www.w3.org/TR/webnn/#dom-ml-createcontext
    */
   export interface WebNNOptionsWithMLContext
-    extends WebNNExecutionProviderName,
+    extends
+      WebNNExecutionProviderName,
       Omit<WebNNContextOptions, 'deviceType'>,
       Required<Pick<WebNNContextOptions, 'deviceType'>> {
-    context: unknown /* MLContext */;
+    context: TryGetGlobalType<'MLContext'>;
   }
 
   /**
@@ -291,8 +403,8 @@ export declare namespace InferenceSession {
    * @see https://www.w3.org/TR/webnn/#dom-ml-createcontext-gpudevice
    */
   export interface WebNNOptionsWebGpu extends WebNNExecutionProviderName {
-    context: unknown /* MLContext */;
-    gpuDevice: unknown /* GPUDevice */;
+    context: TryGetGlobalType<'MLContext'>;
+    gpuDevice: TryGetGlobalType<'GPUDevice'>;
   }
 
   /**
@@ -307,7 +419,24 @@ export declare namespace InferenceSession {
 
   export interface QnnExecutionProviderOption extends ExecutionProviderOption {
     readonly name: 'qnn';
-    // TODO add flags
+    /**
+     * Specify the QNN backend type. E.g., 'cpu' or 'htp'.
+     * Mutually exclusive with `backendPath`.
+     *
+     * @default 'htp'
+     */
+    backendType?: string;
+    /**
+     * Specify a path to the QNN backend library.
+     * Mutually exclusive with `backendType`.
+     */
+    backendPath?: string;
+    /**
+     * Specify whether to enable HTP FP16 precision.
+     *
+     * @default true
+     */
+    enableFp16Precision?: boolean;
   }
   export interface CoreMLExecutionProviderOption extends ExecutionProviderOption {
     readonly name: 'coreml';
@@ -418,10 +547,52 @@ export declare namespace InferenceSession {
 
   // #region value metadata
 
-  // eslint-disable-next-line @typescript-eslint/no-empty-interface
-  interface ValueMetadata {
-    // TBD
+  /**
+   * The common part of the value metadata type for both tensor and non-tensor values.
+   */
+  export interface ValueMetadataBase {
+    /**
+     * The name of the specified input or output.
+     */
+    readonly name: string;
   }
+
+  /**
+   * Represents the metadata of a non-tensor value.
+   */
+  export interface NonTensorValueMetadata extends ValueMetadataBase {
+    /**
+     * Get a value indicating whether the value is a tensor.
+     */
+    readonly isTensor: false;
+  }
+
+  /**
+   * Represents the metadata of a tensor value.
+   */
+  export interface TensorValueMetadata extends ValueMetadataBase {
+    /**
+     * Get a value indicating whether the value is a tensor.
+     */
+    readonly isTensor: true;
+    /**
+     * Get the data type of the tensor.
+     */
+    readonly type: Tensor.Type;
+    /**
+     * Get the shape of the tensor.
+     *
+     * If the shape is not defined, the value will an empty array. Otherwise, it will be an array representing the shape
+     * of the tensor. Each element in the array can be a number or a string. If the element is a number, it represents
+     * the corresponding dimension size. If the element is a string, it represents a symbolic dimension.
+     */
+    readonly shape: ReadonlyArray<number | string>;
+  }
+
+  /**
+   * Represents the metadata of a value.
+   */
+  export type ValueMetadata = NonTensorValueMetadata | TensorValueMetadata;
 
   // #endregion
 }
@@ -493,15 +664,15 @@ export interface InferenceSession {
    */
   readonly outputNames: readonly string[];
 
-  // /**
-  //  * Get input metadata of the loaded model.
-  //  */
-  // readonly inputMetadata: ReadonlyArray<Readonly<InferenceSession.ValueMetadata>>;
+  /**
+   * Get input metadata of the loaded model.
+   */
+  readonly inputMetadata: readonly InferenceSession.ValueMetadata[];
 
-  // /**
-  //  * Get output metadata of the loaded model.
-  //  */
-  // readonly outputMetadata: ReadonlyArray<Readonly<InferenceSession.ValueMetadata>>;
+  /**
+   * Get output metadata of the loaded model.
+   */
+  readonly outputMetadata: readonly InferenceSession.ValueMetadata[];
 
   // #endregion
 }

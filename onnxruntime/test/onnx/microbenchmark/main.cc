@@ -17,6 +17,7 @@
 #include <core/session/onnxruntime_cxx_api.h>
 #include <core/session/ort_env.h>
 #include <core/util/thread_utils.h>
+#include "test/util/include/telemetry_test_environment.h"
 
 #include <iostream>
 #include <unordered_map>
@@ -27,7 +28,7 @@ OrtEnv* env = nullptr;
 using namespace onnxruntime;
 
 static void BM_CPUAllocator(benchmark::State& state) {
-  AllocatorPtr cpu_allocator = std::make_shared<CPUAllocator>();
+  AllocatorPtr cpu_allocator = CPUAllocator::DefaultInstance();
   const size_t len = state.range(0);
   for (auto _ : state) {
     void* p = cpu_allocator->Alloc(len);
@@ -39,10 +40,11 @@ BENCHMARK(BM_CPUAllocator)
     ->Arg(sizeof(Tensor));
 
 static void BM_ResolveGraph(benchmark::State& state) {
+  constexpr const ORTCHAR_T* model_path = ORT_TSTR("transformers/test_data/models/gpt2_embedlayer_exp.onnx");
   std::shared_ptr<onnxruntime::Model> model_copy;
   auto logger = env->GetLoggingManager()->CreateLogger("test");
   auto st =
-      onnxruntime::Model::Load(ORT_TSTR("../models/opset8/test_tiny_yolov2/model.onnx"), model_copy, nullptr, *logger);
+      onnxruntime::Model::Load(model_path, model_copy, nullptr, *logger);
   if (!st.IsOK()) {
     ::std::cerr << "Parse model failed: " << st.ErrorMessage().c_str() << ::std::endl;
     abort();
@@ -75,6 +77,7 @@ BENCHMARK(BM_ResolveGraph);
   } while (0);
 
 int main(int argc, char** argv) {
+  onnxruntime::test::SuppressTelemetryForTests();
   ::benchmark::Initialize(&argc, argv);
   if (::benchmark::ReportUnrecognizedArguments(argc, argv))
     return -1;

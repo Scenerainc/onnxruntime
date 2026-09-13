@@ -7,8 +7,8 @@
 #include "core/graph/graph_viewer.h"
 #include "core/providers/coreml/builders/coreml_spec.h"
 #include "core/providers/coreml/model/model.h"
+#include "core/providers/coreml/coreml_options.h"
 
-#if defined(COREML_ENABLE_MLPROGRAM)
 // coremltools classes
 namespace MPL {
 class ModelPackage;
@@ -19,7 +19,6 @@ namespace Blob {
 class StorageWriter;
 }
 }  // namespace MILBlob
-#endif
 
 namespace onnxruntime {
 namespace coreml {
@@ -29,14 +28,14 @@ class IOpBuilder;
 class ModelBuilder {
  private:
   ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger,
-               int32_t coreml_version, uint32_t coreml_flags,
+               int32_t coreml_version, const CoreMLOptions& coreml_options,
                std::vector<std::string>&& onnx_input_names,
                std::vector<std::string>&& onnx_output_names);
 
  public:
   // Create the CoreML model, serialize to disk, load and compile using the CoreML API and return in `model`
   static Status Build(const GraphViewer& graph_viewer, const logging::Logger& logger,
-                      int32_t coreml_version, uint32_t coreml_flags,
+                      int32_t coreml_version, const CoreMLOptions& coreml_options,
                       std::vector<std::string>&& onnx_input_names,
                       std::vector<std::string>&& onnx_output_names,
                       std::unique_ptr<Model>& model);
@@ -53,14 +52,11 @@ class ModelBuilder {
   // We only support CoreML 3 and later so the spec version is always version + 1.
   int32_t CoreMLVersion() const { return coreml_version_; }
   int32_t CoreMLSpecVersion() const { return coreml_version_ + 1; }
+  bool IsModelCached() const { return is_model_cached_; }
 
   // Returns true if we are creating an ML Program
   bool CreateMLProgram() const {
-#if defined(COREML_ENABLE_MLPROGRAM)
     return create_ml_program_;
-#else
-    return false;
-#endif
   }
 
   /*
@@ -74,7 +70,6 @@ class ModelBuilder {
   // Add layer to the Core ML NeuralNetwork model
   void AddLayer(std::unique_ptr<COREML_SPEC::NeuralNetworkLayer> layer);
 
-#if defined(COREML_ENABLE_MLPROGRAM)
   /*
    * MLProgram helpers
    */
@@ -145,7 +140,6 @@ class ModelBuilder {
 
   // add the operation to the main function
   void AddOperation(std::unique_ptr<COREML_SPEC::MILSpec::Operation> operation);
-#endif
 
   /*
    * General helpers
@@ -174,7 +168,6 @@ class ModelBuilder {
   const logging::Logger& Logger() const { return logger_; }
 
  private:
-#if defined(COREML_ENABLE_MLPROGRAM)
   template <typename T>
   std::string_view AddConstantImpl(std::string_view op_type, std::string_view value_type, gsl::span<const T> value,
                                    std::optional<gsl::span<const int64_t>> shape = std::nullopt);
@@ -188,7 +181,6 @@ class ModelBuilder {
   const std::string& AddConstantOperation(std::string_view name, COREML_SPEC::MILSpec::Value&& initializer);
   const std::string& AddTensorValueAsConstantOperation(std::string_view op_type, std::string_view value_type,
                                                        COREML_SPEC::MILSpec::Value&& input_value);
-#endif
 
   // Convert the ONNX model in graph_viewer_ to a CoreML::Specification::Model and serialize to disk.
   // We then load it using CoreML in order compile it.
@@ -207,6 +199,21 @@ class ModelBuilder {
   Status RegisterModelOutputs();
   Status RegisterModelInputOutput(const NodeArg& node_arg, bool is_input);
 
+  // CoreML's ArrayFeatureType (the external model IO representation) has no bool, so a bool graph
+  // input/output is exposed as an INT32 feature, mirroring the int64 handling. Inside the ML Program
+  // the op builders still operate on bool tensors, so the boundary needs int32<->bool cast ops:
+  //   - bool graph input:  cast(int32 feature) -> bool, then consumers reference the bool value.
+  //   - bool graph output: cast(internal bool) -> int32, which becomes the int32 feature.
+  // RewriteBoolGraphIOBoundaries() inserts those casts after the op builders have run so the builders
+  // stay unaware of the boundary representation. The int32<->bool data conversion happens at runtime
+  // in model.mm, again mirroring int64.
+  Status RewriteBoolGraphIOBoundaries();
+
+  // Append a 'cast' op (input_value_name -> output_value_name with the given ONNX output type) to the
+  // main block. Used only by RewriteBoolGraphIOBoundaries to bridge the int32 feature boundary.
+  void AddBoundaryCastOp(std::string_view input_value_name, std::string_view output_value_name,
+                         int32_t output_onnx_type, gsl::span<const int64_t> shape);
+
   // Record the onnx scalar output names
   void AddScalarOutput(const std::string& output_name);
 
@@ -216,9 +223,10 @@ class ModelBuilder {
   const GraphViewer& graph_viewer_;
   const logging::Logger& logger_;
   const int32_t coreml_version_;
-  const uint32_t coreml_flags_;
-  const bool create_ml_program_;         // ML Program (CoreML5, iOS 15+, macOS 12+) or NeuralNetwork (old)
-  const std::string model_output_path_;  // create_ml_program_ ? dir for mlpackage : filename for mlmodel
+  CoreMLOptions coreml_options_;
+  const bool create_ml_program_;   // ML Program (CoreML5, iOS 15+, macOS 12+) or NeuralNetwork (old)
+  std::string model_output_path_;  // create_ml_program_ ? dir for mlpackage : filename for mlmodel
+  bool is_model_cached_{false};
 
   std::vector<std::string> onnx_input_names_;
   std::vector<std::string> onnx_output_names_;
@@ -228,13 +236,20 @@ class ModelBuilder {
   std::unordered_set<std::string> int64_outputs_;
   std::unordered_map<std::string, OnnxTensorInfo> input_output_info_;
 
+  // bool graph IO exposed as INT32 features (see RewriteBoolGraphIOBoundaries).
+  // For inputs the int32->bool cast is emitted eagerly in RegisterModelInputOutput (so it sits ahead of
+  // its consumers in the block); this map records original input name -> bool value name so the consumer
+  // references can be rewritten after the op builders have run.
+  std::unordered_map<std::string, std::string> bool_input_value_rename_;
+  // For outputs the bool->int32 cast is appended after the op builders run; {name, shape} captured here.
+  std::vector<std::pair<std::string, std::vector<int64_t>>> bool_graph_outputs_;
+
   std::unordered_map<std::string, int> initializer_usage_;
   std::unordered_set<std::string> skipped_inputs_;
 
   uint32_t name_token_{0};
   std::unordered_set<std::string> unique_names_;
 
-#if defined(COREML_ENABLE_MLPROGRAM)
   // mlprogram_main_ is the main block of the CoreML ML Program.
   // It is set in CreateModel to the CoreML Model.mlprogram.functions['main'].block_specializations['CoreML<ver>']
   // entry we create.
@@ -251,7 +266,6 @@ class ModelBuilder {
   // This means an op builder author doesn't need to be aware of the renaming.
   // https://github.com/apple/coremltools/blob/8b37641f243b1a3e81452feea311c6e30dcc9287/coremltools/converters/mil/mil/passes/defs/preprocess.py#L146-L149
   std::unordered_map<std::string, std::string> values_to_rename_;
-#endif
 };
 
 }  // namespace coreml

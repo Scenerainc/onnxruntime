@@ -1,33 +1,131 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <absl/base/config.h>
 
 #include "asserts.h"
+#include "core/framework/allocator_utils.h"
 #include "core/framework/execution_providers.h"
 #include "core/framework/graph_partitioner.h"
 #include "core/framework/kernel_registry.h"
+#include "core/framework/layering_annotations.h"
 #include "core/framework/op_kernel.h"
 #include "core/framework/bfc_arena.h"
+#include "core/framework/ep_context_options.h"
+#include "core/framework/resource_accountant.h"
 #include "core/framework/session_state.h"
+#include "core/framework/workspace_input_shape.h"
 #include "core/graph/graph_utils.h"
 #include "core/graph/graph_viewer.h"
 #include "core/graph/model.h"
+#include "core/graph/model_saving_options.h"
 #include "core/graph/op.h"
 #include "core/providers/cpu/cpu_execution_provider.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/util/thread_utils.h"
 #include "gtest/gtest.h"
 #include "test/test_environment.h"
+#include "test/unittest_util/graph_transform_test_builder.h"
 #include "test/util/include/default_providers.h"
+#include "test/util/include/file_util.h"
 #include "core/optimizer/layout_transformation/layout_transformation.h"
+#include "core/optimizer/graph_optimizer_registry.h"
 
 using namespace ONNX_NAMESPACE;
-using namespace std;
 namespace onnxruntime {
-
 namespace test {
+
+#ifndef ENABLE_TRAINING_CORE
+#ifndef __wasm__
+static void TestSavedPrepacks(const Model& model) {
+  auto inspect = [](const Graph& graph) {
+    const auto& prepacked_for_graph = graph.GetPrepacked();
+    const auto& key_to_blob = prepacked_for_graph.GetKeyToBlob();
+    ASSERT_EQ(1U, key_to_blob.size());
+    const size_t expected_prepacks_for_writing = (graph.ParentGraph() == nullptr) ? 1U : 0U;
+    ASSERT_EQ(expected_prepacks_for_writing, prepacked_for_graph.GetNumberOfWeightsForWriting());
+
+    const size_t expected_blobs_for_writing = (graph.ParentGraph() == nullptr) ? 1U : 0U;
+    ASSERT_EQ(expected_blobs_for_writing, prepacked_for_graph.GetNumberOfKeyedBlobsForWriting());
+
+    if (graph.ParentGraph() == nullptr) {
+      const auto* blob_keys = prepacked_for_graph.GetKeysForWeightForSaving("if_shared");
+      ASSERT_TRUE(blob_keys != nullptr);
+      ASSERT_EQ(blob_keys->size(), 1U);
+      const auto* prepacked_weights = prepacked_for_graph.GetPrepackedWeights(*blob_keys->cbegin());
+      ASSERT_TRUE(prepacked_weights != nullptr);
+      ASSERT_EQ(prepacked_weights->buffer_sizes_.size(), 1U);
+      ASSERT_EQ(prepacked_weights->buffer_sizes_[0], sizeof(float) * 2);
+    }
+  };
+
+  const auto& main_graph = model.MainGraph();
+  inspect(main_graph);
+
+  const auto& nodes = main_graph.Nodes();
+  auto if_node_hit = std::find_if(nodes.begin(), nodes.end(),
+                                  [](const Node& node) { return node.Name() == "if"; });
+  ASSERT_FALSE(if_node_hit == nodes.end());
+  const Node& if_node = *if_node_hit;
+  for (const auto& [_, subgraph] : if_node.GetAttributeNameToSubgraphMap()) {
+    inspect(*subgraph);
+  }
+}
+
+static void TestLoadedSharedUserSupplied(const Model& model) {
+  auto inspect = [](const Graph& graph) {
+    const auto& prepacked_for_graph = graph.GetPrepacked();
+    constexpr size_t expected_prepacks_for_writing = 0U;
+    ASSERT_EQ(expected_prepacks_for_writing, prepacked_for_graph.GetNumberOfWeightsForWriting());
+
+    // We have not loaded anything since this initializer is user supplied
+    const auto& key_to_blob = prepacked_for_graph.GetKeyToBlob();
+    ASSERT_EQ(0U, key_to_blob.size());
+  };
+
+  const auto& main_graph = model.MainGraph();
+  inspect(main_graph);
+
+  const auto& nodes = main_graph.Nodes();
+  auto if_node_hit = std::find_if(nodes.begin(), nodes.end(),
+                                  [](const Node& node) { return node.Name() == "if"; });
+  ASSERT_FALSE(if_node_hit == nodes.end());
+  const Node& if_node = *if_node_hit;
+  for (const auto& [_, subgraph] : if_node.GetAttributeNameToSubgraphMap()) {
+    inspect(*subgraph);
+  }
+}
+
+static void TestLoadedSharedNoUserSupplied(const Model& model) {
+  auto inspect = [](const Graph& graph) {
+    const auto& prepacked_for_graph = graph.GetPrepacked();
+    constexpr size_t expected_prepacks_for_writing = 0U;
+    ASSERT_EQ(expected_prepacks_for_writing, prepacked_for_graph.GetNumberOfWeightsForWriting());
+
+    // We have not loaded anything since this initializer is user supplied
+    const auto& key_to_blob = prepacked_for_graph.GetKeyToBlob();
+    ASSERT_EQ(1U, key_to_blob.size());
+  };
+
+  const auto& main_graph = model.MainGraph();
+  inspect(main_graph);
+
+  const auto& nodes = main_graph.Nodes();
+  auto if_node_hit = std::find_if(nodes.begin(), nodes.end(),
+                                  [](const Node& node) { return node.Name() == "if"; });
+  ASSERT_FALSE(if_node_hit == nodes.end());
+  const Node& if_node = *if_node_hit;
+  for (const auto& [_, subgraph] : if_node.GetAttributeNameToSubgraphMap()) {
+    inspect(*subgraph);
+  }
+}
+
+#endif  // __wasm__
+#endif  // ENABLE_TRAINING_CORE
+
 class TestOpKernel : public OpKernel {
  public:
   TestOpKernel(const OpKernelInfo& p) : OpKernel(p) {
@@ -42,10 +140,55 @@ class TestOpKernel : public OpKernel {
     return Status::OK();
   }
 };
+
+TEST(OpKernelTest, DefaultDeclareWorkspaceRequirementsClearsOutput) {
+  Model model("default_workspace_declaration", false, DefaultLoggingManager().DefaultLogger());
+  Graph& graph = model.MainGraph();
+
+  TypeProto tensor_type;
+  tensor_type.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT);
+  tensor_type.mutable_tensor_type()->mutable_shape()->add_dim()->set_dim_value(1);
+  NodeArg input_arg("input", &tensor_type);
+  NodeArg output_arg("output", &tensor_type);
+  Node& node = graph.AddNode("identity", "Identity", "", {&input_arg}, {&output_arg});
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  ExecutionProviders execution_providers;
+  auto cpu_execution_provider = std::make_unique<CPUExecutionProvider>(CPUExecutionProviderInfo(false));
+  CPUExecutionProvider* cpu_execution_provider_ptr = cpu_execution_provider.get();
+  ASSERT_STATUS_OK(execution_providers.Add(kCpuExecutionProvider, std::move(cpu_execution_provider)));
+
+  DataTransferManager data_transfer_manager;
+  ExternalDataLoaderManager external_data_loader_manager;
+  profiling::Profiler profiler;
+  SessionOptions session_options;
+  SessionState session_state(graph, execution_providers, nullptr, nullptr, data_transfer_manager,
+                             external_data_loader_manager, DefaultLoggingManager().DefaultLogger(),
+                             profiler, session_options);
+
+  auto kernel_def = KernelDefBuilder()
+                        .SetName("Identity")
+                        .Provider(kCpuExecutionProvider)
+                        .SinceVersion(1)
+                        .Build();
+  OpKernelInfo kernel_info(node, *kernel_def, *cpu_execution_provider_ptr,
+                           session_state.GetConstantInitializedTensors(),
+                           session_state.GetOrtValueNameIdxMap(), session_state.GetDataTransferMgr(),
+                           session_state.GetAllocators(), session_state.GetSessionOptions().config_options);
+  TestOpKernel kernel(kernel_info);
+
+  InlinedVector<WorkspaceInputShape> input_shapes;
+  input_shapes.push_back(WorkspaceInputShape::PresentWithoutShape());
+  InlinedVector<WorkspaceRequirement> requirements;
+  requirements.push_back(WorkspaceRequirement{123, /*slot_id=*/7, /*alignment_bytes=*/0});
+  ASSERT_STATUS_OK(kernel.DeclareWorkspaceRequirements(gsl::make_span(input_shapes), requirements));
+  EXPECT_TRUE(requirements.empty());
+}
+
 class SessionStateAddGetKernelTest : public testing::TestWithParam<int> {};
 
 TEST_P(SessionStateAddGetKernelTest, AddGetKernelTest) {
-  OrtThreadPoolParams to;
+  OrtThreadPoolParams to{};
   to.thread_pool_size = GetParam();
   auto tp = concurrency::CreateThreadPool(&onnxruntime::Env::Default(), to, concurrency::ThreadPoolType::INTRA_OP);
   ONNX_OPERATOR_SCHEMA(Variable)
@@ -135,8 +278,8 @@ class SessionStateTestP : public testing::TestWithParam<TestParam> {};
 // Test that we separate out constant and non-constant initializers correctly
 TEST_P(SessionStateTestP, TestInitializerProcessing) {
   const TestParam& param = GetParam();
-  OrtThreadPoolParams to;
-  to.thread_pool_size = to.thread_pool_size;
+  OrtThreadPoolParams to{};
+  to.thread_pool_size = param.thread_count;
   auto tp = concurrency::CreateThreadPool(&onnxruntime::Env::Default(), to, concurrency::ThreadPoolType::INTRA_OP);
 
   std::basic_ostringstream<ORTCHAR_T> oss;
@@ -172,18 +315,22 @@ TEST_P(SessionStateTestP, TestInitializerProcessing) {
   SessionState session_state(graph, execution_providers, tp.get(), nullptr, dtm, edlm,
                              DefaultLoggingManager().DefaultLogger(), profiler, sess_options);
 
-  GraphPartitioner partitioner(krm, execution_providers);
+  // Create GraphOptimizerRegistry instance for providing predefined graph optimizers and selection functions for EPs to lookup
+  auto graph_optimizer_registry = std::make_unique<GraphOptimizerRegistry>(&sess_options,
+                                                                           execution_providers.Get(onnxruntime::kCpuExecutionProvider),
+                                                                           &DefaultLoggingManager().DefaultLogger());
+  GraphPartitioner partitioner(krm, execution_providers, std::move(graph_optimizer_registry));
   ASSERT_STATUS_OK(
       partitioner.Partition(
           graph, session_state.GetMutableFuncMgr(),
           [](Graph& graph, bool& modified, const IExecutionProvider& execution_provider,
              const layout_transformation::DebugGraphFn& debug_graph_fn) -> Status {
-            AllocatorPtr cpu_allocator = std::make_shared<CPUAllocator>();
+            AllocatorPtr cpu_allocator = CPUAllocator::DefaultInstance();
             return layout_transformation::TransformLayoutForEP(
                 graph, modified, execution_provider, std::move(cpu_allocator), debug_graph_fn);
           },
           sess_options.config_options,
-          DefaultLoggingManager().DefaultLogger()));
+          DefaultLoggingManager().DefaultLogger(), nullptr /*layering_index*/));
 
   ASSERT_STATUS_OK(session_state.FinalizeSessionState(oss.str(), krm));
 
@@ -214,33 +361,30 @@ TEST_P(SessionStateTestP, TestInitializerProcessing) {
   }
 }
 
+#ifdef USE_CUDA
 // Test that we allocate memory for an initializer from non-arena memory even if we provide an arena-based allocator
 // if the relevant session option config flag is set
-// For this test we need to enable the arena-based allocator which is not supported on x86 builds, so
-// enable this test only on x64 builds
-#if (defined(__amd64__) || defined(_M_AMD64) || defined(__aarch64__) || defined(_M_ARM64)) && !defined(USE_MIMALLOC) && !defined(ABSL_HAVE_ADDRESS_SANITIZER)
 TEST(SessionStateTest, TestInitializerMemoryAllocatedUsingNonArenaMemory) {
-  AllocatorPtr cpu_allocator = std::make_shared<CPUAllocator>();
-  // Part 1: Feature turned ON (i.e.) allocate from non-arena memory
-  {
-    std::basic_ostringstream<ORTCHAR_T> oss;
-    oss << ORT_TSTR("testdata/mul_1.onnx");
-    Status status;
-    std::shared_ptr<Model> model;
-    ASSERT_TRUE((status = Model::Load(oss.str(), model, nullptr, DefaultLoggingManager().DefaultLogger())).IsOK())
-        << status;
-    Graph& graph = model->MainGraph();
+  AllocatorPtr cpu_allocator = CPUAllocator::DefaultInstance();
+  const auto& default_logger = DefaultLoggingManager().DefaultLogger();
 
-    ExecutionProviders execution_providers;
-    CPUExecutionProviderInfo epi{true};  // use an arena-based allocator for this EP
-    status = execution_providers.Add(onnxruntime::kCpuExecutionProvider, std::make_unique<CPUExecutionProvider>(epi));
-    ASSERT_TRUE(status.IsOK()) << status;
-
-    KernelRegistryManager krm;
-    status = krm.RegisterKernels(execution_providers);
-    ASSERT_TRUE(status.IsOK()) << status;
-
+  auto setup_and_run_test = [&cpu_allocator, &default_logger](Model& model, bool use_device_allocator) -> AllocatorStats {
+    Graph& graph = model.MainGraph();
     DataTransferManager dtm;
+    ExecutionProviders execution_providers;
+    auto tmp_cpu_execution_provider = DefaultCudaExecutionProvider();
+    tmp_cpu_execution_provider->SetLogger(&default_logger);
+    EXPECT_STATUS_OK(dtm.RegisterDataTransfer(tmp_cpu_execution_provider->GetDataTransfer()));
+    EXPECT_STATUS_OK(execution_providers.Add(kCudaExecutionProvider, std::move(tmp_cpu_execution_provider)));
+
+    // Make sure CPU allocator is registered
+    auto cpu_execution_provider = DefaultCpuExecutionProvider();
+    cpu_execution_provider->SetLogger(&default_logger);
+    EXPECT_STATUS_OK(dtm.RegisterDataTransfer(cpu_execution_provider->GetDataTransfer()));
+    EXPECT_STATUS_OK(execution_providers.Add(kCpuExecutionProvider, std::move(cpu_execution_provider)));
+    KernelRegistryManager krm;
+    EXPECT_STATUS_OK(krm.RegisterKernels(execution_providers));
+
     ExternalDataLoaderManager edlm;
     profiling::Profiler profiler;
 
@@ -249,16 +393,23 @@ TEST(SessionStateTest, TestInitializerMemoryAllocatedUsingNonArenaMemory) {
     sess_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
     sess_options.use_deterministic_compute = false;
     sess_options.enable_mem_reuse = true;
-    // disable allocating initialized tensor memory from the arena(by default it will be allocated by the arena)
-    ASSERT_STATUS_OK(sess_options.config_options.AddConfigEntry(kOrtSessionOptionsUseDeviceAllocatorForInitializers,
-                                                                "1"));
+
+    if (use_device_allocator) {
+      // disable allocating initialized tensor memory from the arena(by default it will be allocated by the arena)
+      EXPECT_STATUS_OK(sess_options.config_options.AddConfigEntry(kOrtSessionOptionsUseDeviceAllocatorForInitializers,
+                                                                  "1"));
+    }
 
     SessionState session_state(graph, execution_providers, nullptr, nullptr, dtm, edlm,
-                               DefaultLoggingManager().DefaultLogger(), profiler, sess_options);
+                               default_logger, profiler, sess_options);
 
+    // Create GraphOptimizerRegistry instance for providing predefined graph optimizers and selection functions for EPs to lookup
+    auto graph_optimizer_registry = std::make_unique<GraphOptimizerRegistry>(&sess_options,
+                                                                             execution_providers.Get(kCudaExecutionProvider),
+                                                                             &default_logger);
     // Partition the graph
-    GraphPartitioner partitioner(krm, execution_providers);
-    ASSERT_STATUS_OK(partitioner.Partition(
+    GraphPartitioner partitioner(krm, execution_providers, std::move(graph_optimizer_registry));
+    EXPECT_STATUS_OK(partitioner.Partition(
         graph, session_state.GetMutableFuncMgr(),
         [&cpu_allocator](Graph& graph, bool& modified, const IExecutionProvider& execution_provider,
                          const layout_transformation::DebugGraphFn& debug_graph_fn) -> Status {
@@ -266,89 +417,285 @@ TEST(SessionStateTest, TestInitializerMemoryAllocatedUsingNonArenaMemory) {
                                                              cpu_allocator, debug_graph_fn);
         },
         sess_options.config_options,
-        DefaultLoggingManager().DefaultLogger()));
+        default_logger,
+        nullptr /*layering_index*/));
 
-    ASSERT_STATUS_OK(session_state.FinalizeSessionState(oss.str(), krm));
+    EXPECT_STATUS_OK(session_state.FinalizeSessionState(model.ModelPath(), krm));
 
-    // Fetch the CPU arena-allocator from the session state
-    OrtMemoryInfo mem_info(CPU, OrtArenaAllocator);
+    // Fetch the CUDA arena-allocator from the session state
+    OrtMemoryInfo mem_info(CUDA, OrtArenaAllocator);
     AllocatorPtr alloc = session_state.GetAllocator(mem_info);
-    ASSERT_TRUE(alloc != nullptr);
+    EXPECT_NE(alloc, nullptr);
 
-    // Get stats for the CPU arena-based allocator
+    // Get stats for the CUDA arena-based allocator
     AllocatorStats alloc_stats;
     static_cast<BFCArena*>(alloc.get())->GetStats(&alloc_stats);
 
+    return alloc_stats;
+  };
+
+  const ORTCHAR_T* model_path = ORT_TSTR("testdata/mul_1.onnx");
+  // Part 1: Feature turned ON (i.e.) allocate from non-arena memory
+  {
+    std::shared_ptr<Model> model;
+    ASSERT_STATUS_OK(Model::Load(model_path, model, nullptr, default_logger));
+
+    auto alloc_stats = setup_and_run_test(*model, /*use_device_allocator=*/true);
+
     // Assert that we have made 1 Reserve() call (for allocating memory for the sole initializer in the model)
-    ASSERT_EQ(alloc_stats.num_reserves, 1);
+    ASSERT_EQ(1, alloc_stats.num_reserves);
   }
 
   // Part 2: Feature turned OFF (i.e.) allocate from arena memory (default behavior)
   {
-    std::basic_ostringstream<ORTCHAR_T> oss;
-    oss << ORT_TSTR("testdata/mul_1.onnx");
-    Status status;
     std::shared_ptr<Model> model;
-    ASSERT_TRUE((status = Model::Load(oss.str(), model, nullptr, DefaultLoggingManager().DefaultLogger())).IsOK())
-        << status;
-    Graph& graph = model->MainGraph();
+    ASSERT_STATUS_OK(Model::Load(model_path, model, nullptr, default_logger));
 
-    ExecutionProviders execution_providers;
-    CPUExecutionProviderInfo epi{true};  // use an arena-based allocator for this EP
-    status = execution_providers.Add(onnxruntime::kCpuExecutionProvider, std::make_unique<CPUExecutionProvider>(epi));
-    ASSERT_TRUE(status.IsOK()) << status;
+    auto alloc_stats = setup_and_run_test(*model, /*use_device_allocator=*/false);
 
-    KernelRegistryManager krm;
-    status = krm.RegisterKernels(execution_providers);
-    ASSERT_TRUE(status.IsOK()) << status;
+    // One reserve call should have been made (for allocating memory for the sole initializer in the model)
+    ASSERT_EQ(1, alloc_stats.num_reserves);
 
-    DataTransferManager dtm;
-    ExternalDataLoaderManager edlm;
-    profiling::Profiler profiler;
-
-    SessionOptions sess_options;
-    sess_options.enable_mem_pattern = false;
-    sess_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
-    sess_options.use_deterministic_compute = false;
-    sess_options.enable_mem_reuse = true;
-
-    SessionState session_state(graph, execution_providers, nullptr, nullptr, dtm, edlm,
-                               DefaultLoggingManager().DefaultLogger(), profiler, sess_options);
-
-    // Partition the graph
-    GraphPartitioner partitioner(krm, execution_providers);
-    ASSERT_STATUS_OK(partitioner.Partition(
-        graph, session_state.GetMutableFuncMgr(),
-        [&cpu_allocator](Graph& graph, bool& modified,
-                         const IExecutionProvider& execution_provider,
-                         const layout_transformation::DebugGraphFn& debug_graph_fn) -> Status {
-          return layout_transformation::TransformLayoutForEP(
-              graph, modified, execution_provider, cpu_allocator, debug_graph_fn);
-        },
-        sess_options.config_options,
-        DefaultLoggingManager().DefaultLogger()));
-
-    // Finalize the session state
-    ASSERT_STATUS_OK(session_state.FinalizeSessionState(oss.str(), krm));
-
-    // Fetch the CPU arena-allocator from the session state
-    OrtMemoryInfo mem_info(CPU, OrtArenaAllocator);
-    AllocatorPtr alloc = session_state.GetAllocator(mem_info);
-    ASSERT_TRUE(alloc != nullptr);
-
-    // Get stats for the CPU arena-based allocator
-    AllocatorStats alloc_stats;
-    static_cast<BFCArena*>(alloc.get())->GetStats(&alloc_stats);
-
-    // Assert that we have made no Reserve() calls
-    ASSERT_EQ(alloc_stats.num_reserves, 0);
-
-    // Assert to ensure an allocation was made for the initializer through the arena allocator (Alloc() was invoked)
-    ASSERT_EQ(alloc_stats.num_allocs, 1);
+    // This counter comes from Reserve(). The actual call for arena based allocator went to StreamAwareBFCArena instance
+    ASSERT_EQ(1, alloc_stats.num_allocs);
   }
 }
 
-#endif
+namespace {
+
+using ParitionVerifierFn = std::function<void(const Graph&)>;
+
+// Collect unique node names from a graph and all its subgraphs
+// using the same naming scheme as the resource accountant.
+static void CollectNodeNames(const Graph& graph, std::vector<std::string>& names) {
+  for (const auto& node : graph.Nodes()) {
+    names.push_back(IResourceAccountant::MakeUniqueNodeName(node));
+    for (const auto& [_, subgraph] : node.GetAttributeNameToSubgraphMap()) {
+      CollectNodeNames(*subgraph, names);
+    }
+  }
+}
+
+// Generates a node stats file dynamically from the current graph,
+// assigning each node a fixed cost. Returns the total cost across
+// all nodes so callers can choose a threshold relative to the actual total.
+// This avoids relying on a pre-baked stats file whose node name hashes
+// become stale when graph optimizers change node input/output names.
+static void GenerateDynamicNodeStatsFile(const ORTCHAR_T* model_path,
+                                         const std::filesystem::path& output_path,
+                                         size_t& total_cost,
+                                         size_t cost_per_node = 1024) {
+  const auto& default_logger = DefaultLoggingManager().DefaultLogger();
+  std::shared_ptr<onnxruntime::Model> model;
+  ASSERT_STATUS_OK(Model::Load(model_path, model, nullptr, default_logger));
+  Graph& graph = model->MainGraph();
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  std::vector<std::string> node_names;
+  CollectNodeNames(graph, node_names);
+
+  std::ofstream ofs(output_path);
+  ASSERT_TRUE(ofs.is_open());
+  ofs << "#name,input_sizes,initializers_sizes,total_dynamic_sizes,total_temp_allocations\n";
+  for (const auto& name : node_names) {
+    ofs << name << "," << cost_per_node << ",0,0,0\n";
+  }
+  ofs.close();
+
+  total_cost = node_names.size() * cost_per_node;
+}
+
+void LoadWithResourceAwarePartitioning(const ORTCHAR_T* model_path,
+                                       const SessionOptions& sess_options,
+                                       const ParitionVerifierFn& verifier_fn,
+                                       const std::string& layering_config = std::string()) {
+  const auto& log_manager = DefaultLoggingManager();
+  log_manager.SetDefaultLoggerSeverity(onnxruntime::logging::Severity::kVERBOSE);
+  const auto& default_logger = log_manager.DefaultLogger();
+  std::shared_ptr<onnxruntime::Model> model;
+  ASSERT_STATUS_OK(Model::Load(model_path, model, nullptr, default_logger));
+
+  Graph& graph = model->MainGraph();
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  OrtThreadPoolParams to{};
+  to.thread_pool_size = 1;
+  auto tp = concurrency::CreateThreadPool(&onnxruntime::Env::Default(), to, concurrency::ThreadPoolType::INTRA_OP);
+
+  ExecutionProviders execution_providers;
+  auto tmp_execution_provider = DefaultCudaExecutionProvider();
+  tmp_execution_provider->SetLogger(&default_logger);
+  ASSERT_STATUS_OK(execution_providers.Add(kCudaExecutionProvider, std::move(tmp_execution_provider)));
+  tmp_execution_provider = DefaultCpuExecutionProvider();
+  tmp_execution_provider->SetLogger(&default_logger);
+  ASSERT_STATUS_OK(execution_providers.Add(kCpuExecutionProvider, std::move(tmp_execution_provider)));
+
+  KernelRegistryManager krm;
+  ASSERT_STATUS_OK(krm.RegisterKernels(execution_providers));
+
+  DataTransferManager dtm;
+  ExternalDataLoaderManager edlm;
+  profiling::Profiler profiler;
+
+  SessionState session_state(model->MainGraph(), execution_providers, tp.get(), nullptr, dtm, edlm,
+                             default_logger, profiler, sess_options);
+
+  LayeringIndex* layering_index = nullptr;
+  std::optional<LayeringIndex> layering_index_storage;
+  if (!layering_config.empty()) {
+    ASSERT_STATUS_OK(LayeringIndex::Create(graph, layering_config, /*name_based_config_string=*/"", {}, execution_providers,
+                                           default_logger, layering_index_storage));
+    if (layering_index_storage.has_value()) {
+      layering_index = &layering_index_storage.value();
+    }
+  }
+
+  // Create GraphOptimizerRegistry instance for providing predefined graph optimizers and selection functions for EPs to lookup
+  auto graph_optimizer_registry = std::make_unique<GraphOptimizerRegistry>(&sess_options,
+                                                                           execution_providers.Get(onnxruntime::kCpuExecutionProvider),
+                                                                           &DefaultLoggingManager().DefaultLogger());
+
+  GraphPartitioner partitioner(krm, execution_providers, std::move(graph_optimizer_registry));
+  layout_transformation::TransformLayoutFunction transform_layout_fn;
+  layout_transformation::DebugGraphFn debug_graph_fn;
+  ASSERT_STATUS_OK(
+      partitioner.Partition(graph, session_state.GetMutableFuncMgr(), transform_layout_fn,
+                            sess_options.config_options, default_logger, layering_index,
+                            GraphPartitioner::Mode::kNormal,
+                            epctx::ModelGenOptions{},
+                            debug_graph_fn));
+
+  verifier_fn(graph);
+}
+}  // namespace
+
+TEST(SessionStateTest, TestResourceAwarePartitioning_NoLimit) {
+  constexpr const ORTCHAR_T* model_path = ORT_TSTR("testdata/transformers/tiny_gpt2_beamsearch.onnx");
+
+  // Try to load the model without restrictions
+  // and verify nodes have been placed to CUDA
+  SessionOptions sess_options;
+  sess_options.enable_mem_pattern = false;
+  sess_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
+  sess_options.use_deterministic_compute = false;
+  sess_options.enable_mem_reuse = false;
+
+  LoadWithResourceAwarePartitioning(model_path, sess_options, [](const Graph& graph) {
+    const auto& graph_nodes = graph.Nodes();
+    for (const auto& node : graph_nodes) {
+      EXPECT_EQ(node.GetExecutionProviderType(), kCudaExecutionProvider);
+    }
+  });
+}
+
+TEST(SessionStateTest, TestResourceAwarePartitioning_LargeLimit) {
+  constexpr const ORTCHAR_T* model_path = ORT_TSTR("testdata/transformers/tiny_gpt2_beamsearch.onnx");
+  std::error_code ec;
+  const std::filesystem::path stats_path =
+      std::filesystem::temp_directory_path(ec) / "tiny_gpt2_beamsearch_dynamic_stats_large.txt";
+  ASSERT_FALSE(ec) << "temp_directory_path failed: " << ec.message();
+
+  // Generate node stats dynamically so names always match the current graph
+  constexpr size_t cost_per_node = 1024;
+  size_t total_cost = 0;
+  GenerateDynamicNodeStatsFile(model_path, stats_path, total_cost, cost_per_node);
+  ASSERT_GT(total_cost, 0U);
+
+  // Use a limit much larger than total cost so all nodes are assigned CUDA.
+  size_t large_limit_kb = (total_cost * 2) / 1024 + 1;
+  std::string limit_setting = std::to_string(large_limit_kb) + "," + stats_path.string();
+
+  SessionOptions sess_options;
+  sess_options.enable_mem_pattern = false;
+  sess_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
+  sess_options.use_deterministic_compute = false;
+  sess_options.enable_mem_reuse = false;
+  ASSERT_STATUS_OK(sess_options.config_options.AddConfigEntry(
+      kOrtSessionOptionsResourceCudaPartitioningSettings, limit_setting.c_str()));
+
+  LoadWithResourceAwarePartitioning(model_path, sess_options, [](const Graph& graph) {
+    const auto& graph_nodes = graph.Nodes();
+    for (const auto& node : graph_nodes) {
+      EXPECT_EQ(node.GetExecutionProviderType(), kCudaExecutionProvider);
+    }
+  });
+
+  std::error_code remove_ec;
+  std::filesystem::remove(stats_path, remove_ec);
+}
+
+TEST(SessionStateTest, TestResourceAwarePartitioning_CPUOffloaded) {
+  constexpr const ORTCHAR_T* model_path = ORT_TSTR("testdata/transformers/tiny_gpt2_beamsearch.onnx");
+  std::error_code ec;
+  const std::filesystem::path stats_path =
+      std::filesystem::temp_directory_path(ec) / "tiny_gpt2_beamsearch_dynamic_stats_offload.txt";
+  ASSERT_FALSE(ec) << "temp_directory_path failed: " << ec.message();
+
+  // Generate node stats dynamically so names always match the current graph.
+  constexpr size_t cost_per_node = 1024;
+  size_t total_cost = 0;
+  GenerateDynamicNodeStatsFile(model_path, stats_path, total_cost, cost_per_node);
+  ASSERT_GT(total_cost, 0U);
+
+  // Set threshold to half the total cost so some nodes must be offloaded to CPU.
+  size_t half_limit_kb = (total_cost / 2) / 1024;
+  ASSERT_GT(half_limit_kb, 0U);
+  std::string limit_setting = std::to_string(half_limit_kb) + "," + stats_path.string();
+
+  SessionOptions sess_options;
+  sess_options.enable_mem_pattern = false;
+  sess_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
+  sess_options.use_deterministic_compute = false;
+  sess_options.enable_mem_reuse = false;
+  ASSERT_STATUS_OK(sess_options.config_options.AddConfigEntry(
+      kOrtSessionOptionsResourceCudaPartitioningSettings, limit_setting.c_str()));
+
+  LoadWithResourceAwarePartitioning(model_path, sess_options, [](const Graph& graph) {
+    const auto& graph_nodes = graph.Nodes();
+    bool cpu_node_found = false;
+    for (const auto& node : graph_nodes) {
+      if (node.GetExecutionProviderType() != kCudaExecutionProvider) {
+        cpu_node_found = true;
+        break;
+      }
+    }
+    EXPECT_TRUE(cpu_node_found);
+  });
+
+  std::error_code remove_ec;
+  std::filesystem::remove(stats_path, remove_ec);
+}
+
+TEST(SessionStateTest, TestLayeringPartitioning) {
+  constexpr const ORTCHAR_T* model_path = ORT_TSTR("testdata/layering/tiny_gpt2_beamsearch_layering.onnx");
+  constexpr const char* layering_setting =
+      "cpu(Embed,Decode);gpu(GptAttention0,GptAttention1,GptAttention2,GptAttention3,GptAttention4)";
+
+  // Set the session options for layering
+  SessionOptions sess_options;
+  sess_options.enable_mem_pattern = false;
+  sess_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
+  sess_options.use_deterministic_compute = false;
+  sess_options.enable_mem_reuse = false;
+  ASSERT_STATUS_OK(sess_options.config_options.AddConfigEntry(
+      kOrtSessionOptionsLayerAssignmentSettings, layering_setting));
+
+  LoadWithResourceAwarePartitioning(model_path, sess_options, [](const Graph& graph) {
+     const auto& graph_nodes = graph.Nodes();
+     for (const auto& node : graph_nodes) {
+       const std::string& name = node.Name();
+       const bool expected_on_cpu = (name.find("EmbedLayer") == 0) || (name == "LayerNorm_10") || (name == "MatMul_1165");
+
+       const std::string& ep = node.GetExecutionProviderType();
+       if (expected_on_cpu) {
+         EXPECT_EQ(ep, kCpuExecutionProvider) << "Node " << name << " expected on CPU but found on " << ep;
+       } else {
+         EXPECT_EQ(ep, kCudaExecutionProvider) << "Node " << name << " expected on CUDA but found on " << ep;
+       }
+     } }, layering_setting);
+}
+
+#endif  // USE_CUDA
 
 INSTANTIATE_TEST_SUITE_P(SessionStateTests, SessionStateTestP, testing::ValuesIn(param_list));
 
@@ -362,6 +709,7 @@ class PrePackingTestOpKernel : public OpKernel {
   }
 
   Status UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& prepacked_buffers,
+                                   gsl::span<const size_t> /*prepacked_buffer_sizes*/,
                                    int input_idx,
                                    /*out*/ bool& used_shared_buffers) override {
     ORT_UNUSED_PARAMETER(input_idx);
@@ -372,13 +720,12 @@ class PrePackingTestOpKernel : public OpKernel {
     return Status::OK();
   }
 
-  Status PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc, bool save_prepacked_initializers,
+  Status PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
                  /*out*/ bool& is_packed, /*out*/ PrePackedWeights* prepacked_weights) override {
     ORT_UNUSED_PARAMETER(tensor);
     ORT_UNUSED_PARAMETER(input_idx);
-    ORT_UNUSED_PARAMETER(save_prepacked_initializers);
 
-    size_t weight_packed_len = 8;
+    constexpr const size_t weight_packed_len = sizeof(float) * 2;
     weight_packed_ = IAllocator::MakeUniquePtr<void>(alloc, weight_packed_len, true);
     float* data_weights_packed = reinterpret_cast<float*>(weight_packed_.get());
     data_weights_packed[0] = 1.2345f;
@@ -394,23 +741,33 @@ class PrePackingTestOpKernel : public OpKernel {
     return Status::OK();
   }
 
-  std::optional<Tensor> GetPrePackTensor(int input_idx) override {
-    ORT_UNUSED_PARAMETER(input_idx);
-    ++get_prepack_tensors_count;
-
-    TensorShape shape = {2};
-    packed_tensor = Tensor(DataTypeImpl::GetType<float>(), shape, std::make_shared<CPUAllocator>());
-    return std::move(packed_tensor);
-  }
-
   int prepack_calls_count = 0;
   int store_pre_packed_weight_calls_count = 0;
-  int get_prepack_tensors_count = 0;
   IAllocatorUniquePtr<void> weight_packed_;
-  Tensor packed_tensor;
 };
 
-static void CreateSimpleGraph(Graph& graph) {
+class BrokenPrePackingTestOpKernel : public OpKernel {
+ public:
+  BrokenPrePackingTestOpKernel(const OpKernelInfo& info) : OpKernel(info) {}
+
+  Status Compute(OpKernelContext* context) const override {
+    ORT_UNUSED_PARAMETER(context);
+    return Status::OK();
+  }
+
+  Status PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
+                 /*out*/ bool& is_packed, /*out*/ PrePackedWeights* prepacked_weights) override {
+    ORT_UNUSED_PARAMETER(tensor);
+    ORT_UNUSED_PARAMETER(input_idx);
+    ORT_UNUSED_PARAMETER(alloc);
+    ORT_UNUSED_PARAMETER(prepacked_weights);
+
+    is_packed = true;
+    return Status::OK();
+  }
+};
+
+static void CreateSimpleGraph(Graph& graph, const std::string& op_type = "PrePackingTest") {
   // node creation and placement
   TypeProto type;
   type.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT);
@@ -426,7 +783,7 @@ static void CreateSimpleGraph(Graph& graph) {
   onnxruntime::NodeArg output_arg("node_0_output_0", &type);
   outputs.push_back(&output_arg);
 
-  graph.AddNode("node_0", "PrePackingTest", "node 0", inputs, outputs);
+  graph.AddNode("node_0", op_type, "node 0", inputs, outputs);
 
   // add an initializer
   ONNX_NAMESPACE::TensorProto tensor;
@@ -542,20 +899,38 @@ static void PlaceAllNodesToCPUEP(Graph& graph) {
 struct PrepackingTestParam {
   bool test_subgraph;
   bool test_prepacking;
-  bool test_save_prepack_initializer;
 };
+
+namespace {
+// The PrePackingTest schema is registered into the global ONNX schema registry. Register it only
+// once to avoid duplicate-registration warnings when multiple tests/fixtures run in the same process.
+void RegisterPrePackingTestSchemaOnce() {
+  static std::once_flag pre_packing_schema_registered;
+  std::call_once(pre_packing_schema_registered, []() {
+    ONNX_OPERATOR_SCHEMA(PrePackingTest)
+        .SetDoc("Faking Node for PrePacking")
+        .Input(0, "Input_0", "input 0", "tensor(float)")
+        .Input(1, "Input_1", "input 1", "tensor(float)")
+        .Output(0, "output_0", "docstr for output_0.", "tensor(float)");
+    ONNX_OPERATOR_SCHEMA(BrokenPrePackingTest)
+        .SetDoc("Faking broken Node for PrePacking")
+        .Input(0, "Input_0", "input 0", "tensor(float)")
+        .Input(1, "Input_1", "input 1", "tensor(float)")
+        .Output(0, "output_0", "docstr for output_0.", "tensor(float)");
+  });
+}
+}  // namespace
 
 class SessionStatePrepackingTest : public testing::TestWithParam<PrepackingTestParam> {};
 TEST_P(SessionStatePrepackingTest, PrePackingTest) {
   PrepackingTestParam test_param = GetParam();
 
-  OrtThreadPoolParams to;
+  OrtThreadPoolParams to{};
+  // Use a small, fixed intra-op pool size to keep thread/memory overhead low (e.g., under ASan)
+  // while still exercising the non-null threadpool path.
+  to.thread_pool_size = 2;
   auto tp = concurrency::CreateThreadPool(&onnxruntime::Env::Default(), to, concurrency::ThreadPoolType::INTRA_OP);
-  ONNX_OPERATOR_SCHEMA(PrePackingTest)
-      .SetDoc("Faking Node for PrePacking")
-      .Input(0, "Input_0", "input 0", "tensor(float)")
-      .Input(1, "Input_1", "input 1", "tensor(float)")
-      .Output(0, "output_0", "docstr for output_0.", "tensor(float)");
+  RegisterPrePackingTestSchemaOnce();
 
   ExecutionProviders execution_providers;
   auto cpu_execution_provider = std::make_unique<CPUExecutionProvider>(CPUExecutionProviderInfo(false));
@@ -585,8 +960,6 @@ TEST_P(SessionStatePrepackingTest, PrePackingTest) {
   sess_options.enable_mem_reuse = true;
   sess_options.config_options.configurations[kOrtSessionOptionsConfigDisablePrepacking] =
       test_param.test_prepacking ? "0" : "1";
-  sess_options.config_options.configurations[kOrtSessionOptionsSavePrePackedConstantInitializers] =
-      test_param.test_save_prepack_initializer ? "1" : "0";
 
   SessionState session_state(model.MainGraph(),
                              execution_providers,
@@ -612,47 +985,12 @@ TEST_P(SessionStatePrepackingTest, PrePackingTest) {
   kernel_registry_manager.RegisterKernelRegistry(kernel_registry);
 
   PlaceAllNodesToCPUEP(model.MainGraph());
-  SessionState::PrePackInitializers pre_packed_initializers;
   ASSERT_STATUS_OK(session_state.FinalizeSessionState(std::basic_string<PATH_CHAR_TYPE>(),
-                                                      kernel_registry_manager,
-                                                      pre_packed_initializers));
+                                                      kernel_registry_manager));
 
   const auto& const_initialized_tensors = session_state.GetConstantInitializedTensors();
   // check prepacking
   ASSERT_EQ(const_initialized_tensors.size(), size_t(test_param.test_prepacking ? 0 : 1));
-
-  // check get prepack tensor method called when set save_prepacked_constant_initializers
-  if (!test_param.test_subgraph) {
-    const auto* kernel = reinterpret_cast<const PrePackingTestOpKernel*>(session_state.GetKernel(0));
-    ASSERT_EQ(kernel->get_prepack_tensors_count, (test_param.test_prepacking && test_param.test_save_prepack_initializer) ? 1 : 0);
-  } else {
-    auto if_index = 1;
-    if (session_state.GetKernel(0)->Node().OpType() == "If") {
-      if_index = 0;
-    }
-
-    const auto& subgraph_session_states = session_state.GetSubgraphSessionStateMap();
-    const auto& if_node_session_states = subgraph_session_states.at(if_index);
-    const auto& session_state_1_then_branch_session_state = *if_node_session_states.at("then_branch");
-    const auto& session_state_1_else_branch_session_state = *if_node_session_states.at("else_branch");
-
-    const auto* kernel_if_0 = reinterpret_cast<const PrePackingTestOpKernel*>(session_state_1_then_branch_session_state.GetKernel(0));
-    const auto* kernel_if_1 = reinterpret_cast<const PrePackingTestOpKernel*>(session_state_1_else_branch_session_state.GetKernel(0));
-    ASSERT_EQ(kernel_if_0->get_prepack_tensors_count, (test_param.test_prepacking && test_param.test_save_prepack_initializer) ? 1 : 0);
-    ASSERT_EQ(kernel_if_1->get_prepack_tensors_count, (test_param.test_prepacking && test_param.test_save_prepack_initializer) ? 1 : 0);
-  }
-
-  // check pre_packed_initializers_to_save will be set properly when set save_prepacked_constant_initializers
-  if (!test_param.test_subgraph && test_param.test_prepacking && test_param.test_save_prepack_initializer) {
-    ASSERT_EQ(pre_packed_initializers.pre_packed_initializers_to_save.size(), size_t(1));
-    ASSERT_EQ(pre_packed_initializers.pre_packed_initializers_to_save.count("node_0_input_1"), size_t(1));
-    ASSERT_EQ(pre_packed_initializers.pre_packed_initializers_to_save["node_0_input_1"].count("node_0"), size_t(1));
-  } else if (test_param.test_subgraph && test_param.test_prepacking && test_param.test_save_prepack_initializer) {
-    ASSERT_EQ(pre_packed_initializers.pre_packed_initializers_to_save.size(), size_t(1));
-    ASSERT_EQ(pre_packed_initializers.pre_packed_initializers_to_save.count("if_shared"), size_t(1));
-    ASSERT_EQ(pre_packed_initializers.pre_packed_initializers_to_save["if_shared"].count("if_node_1"), size_t(1));
-    ASSERT_EQ(pre_packed_initializers.pre_packed_initializers_to_save["if_shared"].count("if_node_0"), size_t(1));
-  }
 }
 
 class SessionStateTestSharedInitalizersWithPrePacking : public ::testing::Test {
@@ -666,13 +1004,11 @@ class SessionStateTestSharedInitalizersWithPrePacking : public ::testing::Test {
   std::unique_ptr<concurrency::ThreadPool> tp;
 
   void SetUp() override {
-    OrtThreadPoolParams to;
+    OrtThreadPoolParams to{};
+    // Use a small, fixed intra-op pool size to keep thread/memory overhead low (e.g., under ASan).
+    to.thread_pool_size = 2;
     tp = concurrency::CreateThreadPool(&onnxruntime::Env::Default(), to, concurrency::ThreadPoolType::INTRA_OP);
-    ONNX_OPERATOR_SCHEMA(PrePackingTest)
-        .SetDoc("Faking Node for PrePacking")
-        .Input(0, "Input_0", "input 0", "tensor(float)")
-        .Input(1, "Input_1", "input 1", "tensor(float)")
-        .Output(0, "output_0", "docstr for output_0.", "tensor(float)");
+    RegisterPrePackingTestSchemaOnce();
 
     auto cpu_execution_provider = std::make_unique<CPUExecutionProvider>(CPUExecutionProviderInfo(false));
     ASSERT_STATUS_OK(execution_providers.Add(kCpuExecutionProvider, std::move(cpu_execution_provider)));
@@ -692,11 +1028,25 @@ class SessionStateTestSharedInitalizersWithPrePacking : public ::testing::Test {
         KernelCreateInfo(std::move(kernel_def),
                          [](FuncManager&, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status { out =  std::make_unique<PrePackingTestOpKernel>(info); return Status::OK(); })));
 
+    auto broken_kernel_def = KernelDefBuilder()
+                                 .SetName("BrokenPrePackingTest")
+                                 .Provider(kCpuExecutionProvider)
+                                 .SinceVersion(1)
+                                 .Build();
+
+    ASSERT_STATUS_OK(kernel_registry->Register(
+        KernelCreateInfo(std::move(broken_kernel_def),
+                         [](FuncManager&, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status {
+                           out = std::make_unique<BrokenPrePackingTestOpKernel>(info);
+                           return Status::OK();
+                         })));
+
     kernel_registry_manager.RegisterKernelRegistry(kernel_registry);
   }
 };
 
-// Pre-packing enabled + no shared initializers = no pre-packed weights caching
+// Pre-packing enabled + no shared initializers, however, we put all the pre-packs
+// in a session_state container for ownership.
 TEST_F(SessionStateTestSharedInitalizersWithPrePacking, test1) {
   SessionOptions sess_options;
   sess_options.enable_mem_pattern = true;
@@ -728,10 +1078,11 @@ TEST_F(SessionStateTestSharedInitalizersWithPrePacking, test1) {
 
   const auto* kernel = reinterpret_cast<const PrePackingTestOpKernel*>(session_state_1.GetKernel(0));
 
-  // Assert that a pre-pack call was made and that no mechanism to store weight from shared container was invoked
+  // Assert that a pre-pack call was made. However, they sharing call is still made from a serialized container.
   ASSERT_EQ(session_state_1.GetNumberOfPrepacksCounter(), static_cast<size_t>(1));
   ASSERT_EQ(kernel->prepack_calls_count, 1);
-  ASSERT_EQ(kernel->store_pre_packed_weight_calls_count, 0);
+  // In this case the sharing comes from the serialized container
+  ASSERT_EQ(kernel->store_pre_packed_weight_calls_count, 1);
 
   // Second session/model
   Model model_2("graph_main", false, ModelMetaData(), PathString(), IOnnxRuntimeOpSchemaRegistryList(),
@@ -755,10 +1106,11 @@ TEST_F(SessionStateTestSharedInitalizersWithPrePacking, test1) {
 
   kernel = reinterpret_cast<const PrePackingTestOpKernel*>(session_state_2.GetKernel(0));
 
-  // Assert that a pre-pack call was made and that no mechanism to store weight from shared container was invoked
+  // Assert that a pre-pack call was made. The weights are still shared from the serialized container
+  // either because they are loaded from disk or because the container takes ownership of them.
   ASSERT_EQ(session_state_2.GetNumberOfPrepacksCounter(), static_cast<size_t>(1));
   ASSERT_EQ(kernel->prepack_calls_count, 1);
-  ASSERT_EQ(kernel->store_pre_packed_weight_calls_count, 0);
+  ASSERT_EQ(kernel->store_pre_packed_weight_calls_count, 1);
 }
 
 // Pre-packing enabled + shared initializers + no pre-packed weights container = no pre-packed weights caching
@@ -775,9 +1127,8 @@ TEST_F(SessionStateTestSharedInitalizersWithPrePacking, test2) {
   OrtMemoryInfo mem_info(CPU, OrtDeviceAllocator);
   std::vector<float> float_data(1, 1);
   auto value = std::make_unique<OrtValue>();
-  Tensor::InitOrtValue(DataTypeImpl::GetType<float>(),
-                       TensorShape(std::vector<int64_t>{1}), reinterpret_cast<void*>(float_data.data()),
-                       mem_info, *value);
+  Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), TensorShape(std::vector<int64_t>{1}),
+                       float_data.data(), mem_info, *value);
 
   ASSERT_STATUS_OK(sess_options.AddInitializer("node_0_input_1", value.get()));
 
@@ -803,10 +1154,10 @@ TEST_F(SessionStateTestSharedInitalizersWithPrePacking, test2) {
 
   const auto* kernel = reinterpret_cast<const PrePackingTestOpKernel*>(session_state_1.GetKernel(0));
 
-  // Assert that a pre-pack call was made and that no mechanism to store weight from shared container was invoked
+  // Assert that a pre-pack call was made, but sharing still takes place from the serialized container
   ASSERT_EQ(session_state_1.GetNumberOfPrepacksCounter(), static_cast<size_t>(1));
   ASSERT_EQ(kernel->prepack_calls_count, 1);
-  ASSERT_EQ(kernel->store_pre_packed_weight_calls_count, 0);
+  ASSERT_EQ(kernel->store_pre_packed_weight_calls_count, 1);
 
   // Second session/model
   Model model_2("graph_main", false, ModelMetaData(), PathString(), IOnnxRuntimeOpSchemaRegistryList(),
@@ -830,10 +1181,10 @@ TEST_F(SessionStateTestSharedInitalizersWithPrePacking, test2) {
 
   kernel = reinterpret_cast<const PrePackingTestOpKernel*>(session_state_2.GetKernel(0));
 
-  // Assert that a pre-pack call was made and that no mechanism to store weight from shared container was invoked
+  // Assert that a pre-pack call was made, but sharing still takes place from the serialized container
   ASSERT_EQ(session_state_2.GetNumberOfPrepacksCounter(), static_cast<size_t>(1));
   ASSERT_EQ(kernel->prepack_calls_count, 1);
-  ASSERT_EQ(kernel->store_pre_packed_weight_calls_count, 0);
+  ASSERT_EQ(kernel->store_pre_packed_weight_calls_count, 1);
 }
 
 // Pre-packing enabled + shared initializers + pre-packed weights container = pre-packed weights caching enabled
@@ -920,6 +1271,46 @@ TEST_F(SessionStateTestSharedInitalizersWithPrePacking, test3) {
   // from another instance of the same op_type consuming the same constant initializer.
   // Assert this.
   ASSERT_EQ(session_state_2.GetUsedSharedPrePackedWeightCounter(), static_cast<size_t>(1));
+}
+
+TEST_F(SessionStateTestSharedInitalizersWithPrePacking, BrokenKernelWithoutCacheableBuffersFails) {
+  SessionOptions sess_options;
+  sess_options.enable_mem_pattern = true;
+  sess_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
+  sess_options.use_deterministic_compute = false;
+  sess_options.enable_mem_reuse = true;
+  sess_options.config_options.configurations[kOrtSessionOptionsConfigDisablePrepacking] = "0";
+
+  OrtMemoryInfo mem_info(CPU, OrtDeviceAllocator);
+  std::vector<float> float_data(1, 1);
+  auto value = std::make_unique<OrtValue>();
+  Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), TensorShape(std::vector<int64_t>{1}),
+                       reinterpret_cast<void*>(float_data.data()), mem_info, *value);
+
+  ASSERT_STATUS_OK(sess_options.AddInitializer("node_0_input_1", value.get()));
+
+  PrepackedWeightsContainer prepacked_weights_container;
+
+  Model model("graph_main", false, ModelMetaData(), PathString(), IOnnxRuntimeOpSchemaRegistryList(),
+              domain_to_version, std::vector<ONNX_NAMESPACE::FunctionProto>(),
+              DefaultLoggingManager().DefaultLogger());
+
+  CreateSimpleGraph(model.MainGraph(), "BrokenPrePackingTest");
+  PlaceAllNodesToCPUEP(model.MainGraph());
+  SessionState session_state(model.MainGraph(),
+                             execution_providers,
+                             tp.get(),
+                             nullptr, /*inter_op_thread_pool*/
+                             dtm,
+                             edlm,
+                             DefaultLoggingManager().DefaultLogger(),
+                             profiler,
+                             sess_options,
+                             &prepacked_weights_container);
+
+  ASSERT_STATUS_NOT_OK_AND_HAS_SUBSTR(
+      session_state.FinalizeSessionState(std::basic_string<PATH_CHAR_TYPE>(), kernel_registry_manager),
+      "doesn't have an implementation that can cache computed pre-packed weights");
 }
 
 // Pre-packing enabled + shared initializers +
@@ -1048,17 +1439,202 @@ TEST_F(SessionStateTestSharedInitalizersWithPrePacking, test4) {
   ASSERT_EQ(if_node_branches_shared_prepack_counter_2, static_cast<size_t>(2));
 }
 
+#ifndef __wasm__
+// sharing is on
+TEST_F(SessionStateTestSharedInitalizersWithPrePacking, TestPrepackedSerialization) {
+  const std::filesystem::path model_with_external_initializers =
+      "testdata/test_prepacked_serialization_optimized_model.onnx";
+
+  const std::filesystem::path external_initializers_file =
+      "test_prepacked_serialization_optimized_model.bin";
+
+  {
+    SessionOptions sess_options;
+    sess_options.enable_mem_pattern = true;
+    sess_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
+    sess_options.use_deterministic_compute = false;
+    sess_options.enable_mem_reuse = true;
+    sess_options.optimized_model_filepath = model_with_external_initializers;
+
+    // Enable pre-packing
+    sess_options.config_options.configurations[kOrtSessionOptionsConfigDisablePrepacking] = "0";
+    // Enable saving model with pre-packed weights
+    sess_options.config_options.configurations[kOrtSessionOptionsSavePrePackedConstantInitializers] = "1";
+
+    // Enable shared initializer
+    OrtMemoryInfo mem_info(CPU, OrtDeviceAllocator);
+    std::vector<float> float_data(1, 1);
+    auto value = std::make_unique<OrtValue>();
+    Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), TensorShape(std::vector<int64_t>{1}),
+                         reinterpret_cast<void*>(float_data.data()), mem_info, *value);
+
+    ASSERT_STATUS_OK(sess_options.AddInitializer("if_shared", value.get()));
+
+    // Enable pre-packed weights container for shared initializers
+    PrepackedWeightsContainer prepacked_weights_container;
+    Model model_1("graph_main", false, ModelMetaData(), PathString(), IOnnxRuntimeOpSchemaRegistryList(),
+                  domain_to_version, std::vector<ONNX_NAMESPACE::FunctionProto>(),
+                  DefaultLoggingManager().DefaultLogger());
+
+    CreateGraphWithSubgraph(model_1.MainGraph());
+    PlaceAllNodesToCPUEP(model_1.MainGraph());
+    SessionState session_state_1(model_1.MainGraph(),
+                                 execution_providers,
+                                 tp.get(),
+                                 nullptr, /*inter_op_thread_pool*/
+                                 dtm,
+                                 edlm,
+                                 DefaultLoggingManager().DefaultLogger(),
+                                 profiler,
+                                 sess_options,
+                                 &prepacked_weights_container);
+
+    constexpr const bool saving_model_true = true;
+
+    ASSERT_STATUS_OK(session_state_1.FinalizeSessionState(std::basic_string<PATH_CHAR_TYPE>(),
+                                                          kernel_registry_manager,
+                                                          !saving_model_true));
+
+    TestSavedPrepacks(model_1);
+
+    ModelSavingOptions model_saving_options{4};
+    model_saving_options.align_offset = true;
+
+    ASSERT_STATUS_OK(Model::SaveWithExternalInitializers(model_1, model_with_external_initializers,
+                                                         external_initializers_file,
+                                                         model_saving_options));
+  }
+  ScopedFileDeleter test_model_deleter(model_with_external_initializers);
+  ScopedFileDeleter binary_file_deleter(external_initializers_file);
+
+  // Now let's load the model along with the initializers
+  {
+    SessionOptions sess_options;
+    sess_options.enable_mem_pattern = true;
+    sess_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
+    sess_options.use_deterministic_compute = false;
+    sess_options.enable_mem_reuse = true;
+
+    // Enable pre-packing
+    sess_options.config_options.configurations[kOrtSessionOptionsConfigDisablePrepacking] = "0";
+
+    // We are expecting this weight to be loaded from disk along
+    // with its pre-packed version
+    // Enable shared initializer
+    OrtMemoryInfo mem_info(CPU, OrtDeviceAllocator);
+    std::vector<float> float_data(1, 1);
+    auto value = std::make_unique<OrtValue>();
+    Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), TensorShape(std::vector<int64_t>{1}),
+                         reinterpret_cast<void*>(float_data.data()), mem_info, *value);
+
+    ASSERT_STATUS_OK(sess_options.AddInitializer("if_shared", value.get()));
+
+    // Enable pre-packed weights container for shared initializers
+    PrepackedWeightsContainer prepacked_weights_container;
+
+    std::shared_ptr<Model> model;
+    ASSERT_STATUS_OK(Model::Load(model_with_external_initializers, model, nullptr,
+                                 DefaultLoggingManager().DefaultLogger()));
+
+    PlaceAllNodesToCPUEP(model->MainGraph());
+    SessionState session_state(model->MainGraph(),
+                               execution_providers,
+                               tp.get(),
+                               nullptr, /*inter_op_thread_pool*/
+                               dtm,
+                               edlm,
+                               DefaultLoggingManager().DefaultLogger(),
+                               profiler,
+                               sess_options,
+                               &prepacked_weights_container);
+
+    ASSERT_STATUS_OK(session_state.FinalizeSessionState(std::basic_string<PATH_CHAR_TYPE>(),
+                                                        kernel_registry_manager,
+                                                        false));
+
+    TestLoadedSharedUserSupplied(*model);
+  }
+
+  // Load again, this time sharing is enabled, but no shared initializer in the map
+  {
+    SessionOptions sess_options;
+    sess_options.enable_mem_pattern = true;
+    sess_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
+    sess_options.use_deterministic_compute = false;
+    sess_options.enable_mem_reuse = true;
+
+    // Enable pre-packing
+    sess_options.config_options.configurations[kOrtSessionOptionsConfigDisablePrepacking] = "0";
+
+    // Enable pre-packed weights container for shared initializers
+    PrepackedWeightsContainer prepacked_weights_container;
+
+    std::shared_ptr<Model> model;
+    ASSERT_STATUS_OK(Model::Load(model_with_external_initializers, model, nullptr,
+                                 DefaultLoggingManager().DefaultLogger()));
+
+    PlaceAllNodesToCPUEP(model->MainGraph());
+    SessionState session_state(model->MainGraph(),
+                               execution_providers,
+                               tp.get(),
+                               nullptr, /*inter_op_thread_pool*/
+                               dtm,
+                               edlm,
+                               DefaultLoggingManager().DefaultLogger(),
+                               profiler,
+                               sess_options,
+                               &prepacked_weights_container);
+
+    ASSERT_STATUS_OK(session_state.FinalizeSessionState(model_with_external_initializers,
+                                                        kernel_registry_manager,
+                                                        false));
+
+    TestLoadedSharedNoUserSupplied(*model);
+  }
+  // Load again, sharing is disabled
+  {
+    SessionOptions sess_options;
+    sess_options.enable_mem_pattern = true;
+    sess_options.execution_mode = ExecutionMode::ORT_SEQUENTIAL;
+    sess_options.use_deterministic_compute = false;
+    sess_options.enable_mem_reuse = true;
+
+    // Enable pre-packing
+    sess_options.config_options.configurations[kOrtSessionOptionsConfigDisablePrepacking] = "0";
+
+    std::shared_ptr<Model> model;
+    ASSERT_STATUS_OK(Model::Load(model_with_external_initializers, model, nullptr,
+                                 DefaultLoggingManager().DefaultLogger()));
+
+    PlaceAllNodesToCPUEP(model->MainGraph());
+    SessionState session_state(model->MainGraph(),
+                               execution_providers,
+                               tp.get(),
+                               nullptr, /*inter_op_thread_pool*/
+                               dtm,
+                               edlm,
+                               DefaultLoggingManager().DefaultLogger(),
+                               profiler,
+                               sess_options,
+                               nullptr);
+
+    ASSERT_STATUS_OK(session_state.FinalizeSessionState(model_with_external_initializers,
+                                                        kernel_registry_manager,
+                                                        false));
+
+    const auto& prepacked_for_main_graph = model->MainGraph().GetPrepacked();
+    ASSERT_FALSE(prepacked_for_main_graph.IsSaveModeOn());
+    ASSERT_EQ(1U, prepacked_for_main_graph.GetKeyToBlob().size());
+  }
+}
+#endif  // __wasm__
+
 INSTANTIATE_TEST_SUITE_P(SessionStateTests,
                          SessionStatePrepackingTest,
-                         testing::Values(PrepackingTestParam{false, false, false},
-                                         PrepackingTestParam{false, true, false},
-                                         PrepackingTestParam{true, false, false},
-                                         PrepackingTestParam{true, true, false},
-                                         PrepackingTestParam{false, false, true},
-                                         PrepackingTestParam{false, true, true},
-                                         PrepackingTestParam{true, false, true},
-                                         PrepackingTestParam{true, true, true}));
+                         testing::Values(PrepackingTestParam{false, false},
+                                         PrepackingTestParam{false, true},
+                                         PrepackingTestParam{true, false},
+                                         PrepackingTestParam{true, true}));
 #endif
-
 }  // namespace test
 }  // namespace onnxruntime

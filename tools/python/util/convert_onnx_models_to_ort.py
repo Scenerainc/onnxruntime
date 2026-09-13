@@ -106,12 +106,15 @@ def _convert(
 
     providers = ["CPUExecutionProvider"]
 
-    # if the optimization level is 'all' we manually exclude the NCHWc transformer. It's not applicable to ARM
-    # devices, and creates a device specific model which won't run on all hardware.
+    # if the optimization level is greater than or equal to 'layout' we manually exclude the NCHWc transformer.
+    # It's not applicable to ARM devices, and creates a device specific model which won't run on all hardware.
     # If someone really really really wants to run it they could manually create an optimized onnx model first,
     # or they could comment out this code.
     optimizer_filter = None
-    if optimization_level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL and target_platform != "amd64":
+    if (
+        (optimization_level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
+        or (optimization_level == ort.GraphOptimizationLevel.ORT_ENABLE_LAYOUT)
+    ) and target_platform != "amd64":
         optimizer_filter = ["NchwcTransformer"]
 
     converted_models = []
@@ -210,7 +213,8 @@ def parse_args():
         "other optimizations to be applied at runtime if possible. This is useful when using a "
         "compiling EP like NNAPI or CoreML that may run an unknown (at model conversion time) "
         "number of nodes. The saved optimizations can further optimize nodes not assigned to the "
-        "compiling EP at runtime.",
+        "compiling EP at runtime. Replay must be enabled with the "
+        "'session.enable_saved_runtime_optimizations' session option and should only be enabled for trusted models.",
     )
 
     parser.add_argument(
@@ -304,6 +308,12 @@ def convert_onnx_models_to_ort(
         print(
             f"Converting models with optimization style '{optimization_style.name}' and level '{optimization_level_str}'"
         )
+        if optimization_style == OptimizationStyle.Runtime:
+            print(
+                "WARNING: Saved runtime optimizations are replayed only when "
+                "'session.enable_saved_runtime_optimizations' is set to '1'. "
+                "Enable this option only for trusted models."
+            )
 
         converted_models = _convert(
             model_path_or_dir=model_path_or_dir,

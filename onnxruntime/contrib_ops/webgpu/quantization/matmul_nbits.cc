@@ -1,43 +1,22 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <string>
+#include <string_view>
+
 #include "contrib_ops/webgpu/quantization/matmul_nbits.h"
+#include "contrib_ops/webgpu/quantization/matmul_nbits_common.h"
+#include "contrib_ops/webgpu/quantization/subgroup_matrix_matmul_nbits.h"
+#include "contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h"
 #include "contrib_ops/webgpu/webgpu_contrib_kernels.h"
 #include "core/providers/cpu/math/matmul_helper.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/webgpu_supported_types.h"
+#include "core/providers/webgpu/webgpu_utils.h"
 
 namespace onnxruntime {
 namespace contrib {
 namespace webgpu {
-
-namespace {
-// Put it to a common place?
-uint32_t GetMaxComponents(uint32_t size) {
-  // we cannot use vec3 type since it has alignment of 16 bytes
-  if (size % 4 == 0) {
-    return 4;
-  } else if (size % 2 == 0) {
-    return 2;
-  }
-
-  return 1;
-}
-
-std::string QuantizedDataType(int components) {
-  switch (components) {
-    case 1:
-      return "array<output_element_t, 8>";
-    case 2:
-      return "mat4x2<output_element_t>";
-    case 4:
-      return "mat2x4<output_element_t>";
-    default:
-      return "array<output_element_t, 8>";
-  }
-}
-
-}  // namespace
 
 ONNX_OPERATOR_KERNEL_EX(
     MatMulNBits,
@@ -51,272 +30,88 @@ ONNX_OPERATOR_KERNEL_EX(
         .TypeConstraint("T4", DataTypeImpl::GetTensorType<int32_t>()),
     MatMulNBits);
 
-Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
-  const auto& a = shader.AddInput("input_a", ShaderUsage::UseUniform | ShaderUsage::UseIndicesTypeAlias | ShaderUsage::UseValueTypeAlias);
-  const auto& b = shader.AddInput("input_b", ShaderUsage::UseUniform | ShaderUsage::UseIndicesTypeAlias | ShaderUsage::UseValueTypeAlias);
-  const auto& scales = shader.AddInput("scales", ShaderUsage::UseUniform);
-  const auto& y = shader.AddOutput("output", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias | ShaderUsage::UseIndicesTypeAlias);
-
-  if (use_block32_) {
-    const uint32_t workgroup_size = WorkgroupSizeX() * WorkgroupSizeY();
-    const uint32_t tile_size = WorkgroupSizeX() * components_b_ * 8;  // each uint32 has 8 data.
-    const uint32_t a_length_per_tile = tile_size / a.NumComponents();
-    constexpr uint32_t block_size = 32;
-    const uint32_t blocks_per_tile = tile_size / block_size;
-    shader.AdditionalImplementation() << "var<workgroup> sub_a: array<input_a_value_t, " << a_length_per_tile << ">;\n"
-                                      << "var<workgroup> inter_results: array<array<output_value_t, " << WorkgroupSizeX() << ">, " << WorkgroupSizeY() << ">;\n";
-    std::string offset = "workgroup_idx * " + std::to_string(WorkgroupSizeY());
-    shader.MainFunctionBody() << "  let output_indices = " << y.OffsetToIndices(offset) << ";\n"
-                              << "  let col = output_indices[2];\n"
-                                 "  let row = output_indices[1];\n"
-                                 "  let batch = output_indices[0];\n"
-                                 "  let n_blocks_per_col = uniforms.input_b_shape[1];\n"
-                              << "  let num_tiles =  (n_blocks_per_col - 1) / " << blocks_per_tile << " + 1;\n"
-                              // Loop over shared dimension.
-                              << "  for (var tile: u32 = 0; tile < num_tiles; tile += 1) {\n"
-                              << "    let a_col_start = tile * " << a_length_per_tile << ";\n"
-                              << "    // load one tile A data into shared memory.\n"
-                              << "    for (var a_offset = local_idx; a_offset < " << a_length_per_tile << "; a_offset += " << workgroup_size << ") {\n"
-                              << "      let a_col = a_col_start + a_offset;\n"
-                                 "      if (a_col < uniforms.input_a_shape[2]) {\n"
-                              << "        sub_a[a_offset] = " << a.GetByIndices("input_a_indices_t(batch, row, a_col)") << ";\n"
-                              << "      } else {\n"
-                                 "        sub_a[a_offset] = input_a_value_t(0);\n"
-                                 "      }\n"
-                                 "    }\n"
-                                 "    workgroupBarrier();\n"
-                                 // Each thread processes one block.
-                                 "    let b_row = col + local_id.y;\n"
-                              << "    let block = tile * " << blocks_per_tile << " + local_id.x;\n";
-    if (has_zero_points_) {
-      const auto& zero_points = shader.AddInput("zero_points", ShaderUsage::UseUniform);
-      shader.MainFunctionBody() << "    let zero_point_bytes_per_col = (n_blocks_per_col + 1) / 2;\n"
-                                   "    let zero_point_byte_count = b_row * zero_point_bytes_per_col + (block >> 0x1u);\n"
-                                   "    let zero_point_word_index = zero_point_byte_count >> 0x2u;\n"
-                                   "    let zero_point_byte_offset = zero_point_byte_count & 0x3u;\n"
-                                   "    let zero_point_nibble_offset: u32 = block & 0x1u;\n"
-                                   "    let zero_point_bits_offset = (zero_point_byte_offset << 3) + (zero_point_nibble_offset << 2);\n"
-                                << "    let zero_point_word = " << zero_points.GetByOffset("zero_point_word_index") << " >> zero_point_bits_offset;\n"
-                                << "    let zero_point = output_element_t((zero_point_word) & 0xFu);\n";
-    } else {
-      // The default zero point is 8 for unsigned 4-bit quantization.
-      shader.MainFunctionBody() << "    let zero_point = output_element_t(8.0);\n";
-    }
-    shader.MainFunctionBody() << "    var scale = output_element_t(0);\n"
-                                 "    var b_data = input_b_value_t(0);\n"
-                              << "    if (block < n_blocks_per_col) {\n"
-                              << "      scale = " << scales.GetByOffset("b_row * n_blocks_per_col + block") << ";\n"
-                              << "      b_data = " << b.GetByIndices("input_b_indices_t(b_row, block, 0)") << ";\n"
-                              << "    }\n"
-                              << "    var word_offset = local_id.x * " << block_size / a.NumComponents() << ";\n"
-                              << "    for (var i: u32 = 0; i < " << components_b_ << "; i++) {\n";
-    switch (a.NumComponents()) {
-      case 1:
-        shader.MainFunctionBody() << "      let a_data0 = vec4<output_element_t>(sub_a[word_offset], sub_a[word_offset + 1], sub_a[word_offset + 2], sub_a[word_offset + 3]);\n"
-                                     "      let a_data1 = vec4<output_element_t>(sub_a[word_offset + 4], sub_a[word_offset + 5], sub_a[word_offset + 6], sub_a[word_offset + 7]);\n";
-        break;
-      case 2:
-        shader.MainFunctionBody() << "      let a_data0 = vec4<output_element_t>(sub_a[word_offset], sub_a[word_offset + 1]);\n"
-                                     "      let a_data1 = vec4<output_element_t>(sub_a[word_offset + 2], sub_a[word_offset + 3]);\n";
-        break;
-      case 4:
-        shader.MainFunctionBody() << "      let a_data0 = sub_a[word_offset];\n"
-                                     "      let a_data1 = sub_a[word_offset + 1];\n";
-        break;
-      default:
-        break;
-    }
-    shader.MainFunctionBody() << "      let b_value = b_data";
-    if (components_b_ > 1) {
-      shader.MainFunctionBody() << "[i]";
-    }
-    shader.MainFunctionBody() << ";\n"
-                                 "      let b_value_lower = unpack4xU8(b_value & 0x0F0F0F0Fu);\n"
-                                 "      let b_value_upper = unpack4xU8((b_value >> 4) & 0x0F0F0F0Fu);\n"
-                                 "      let b_quantized_values = mat2x4<output_element_t>(output_element_t(b_value_lower[0]), output_element_t(b_value_upper[0]), output_element_t(b_value_lower[1]), output_element_t(b_value_upper[1]), output_element_t(b_value_lower[2]), output_element_t(b_value_upper[2]), output_element_t(b_value_lower[3]), output_element_t(b_value_upper[3]));\n"
-                                 "      let b_dequantized_values = (b_quantized_values - mat2x4<output_element_t>(";
-    for (int i = 0; i < 8; i++) {
-      shader.MainFunctionBody() << "zero_point";
-      if (i < 7) {
-        shader.MainFunctionBody() << ", ";
-      }
-    }
-    shader.MainFunctionBody() << ")) * scale;\n"
-                                 "      inter_results[local_id.y][local_id.x] += dot(a_data0, b_dequantized_values[0]) + dot(a_data1, b_dequantized_values[1]);\n"
-                              << "      word_offset += " << 8 / a.NumComponents() << ";\n"
-                              << "    }\n"
-                                 "    workgroupBarrier();\n"
-                                 "  }\n"
-                              << "  if (local_idx < " << WorkgroupSizeY() << ") {\n"
-                              << "    var output_value = output_value_t(0);\n"
-                              << "    for (var b = 0u; b < " << WorkgroupSizeX() << "; b++) {\n"
-                              << "      output_value += inter_results[local_idx][b];\n"
-                                 "    }\n"
-                                 "    if (col + local_idx < uniforms.output_shape[2]) {\n"
-                              << "      " << y.SetByIndices("output_indices_t(batch, row, col + local_idx)", "output_value") << ";\n"
-                              << "    }\n"
-                                 "  }\n";
-  } else {
-    const std::string quantized_data_type = QuantizedDataType(a.NumComponents());
-    const int output_element_number = y.NumComponents() * gsl::narrow<int>(output_number_);
-
-    const uint32_t shared_memory_size = output_number_ * WORKGROUP_SIZE;
-    std::string offset = "workgroup_idx * " + std::to_string(output_number_);
-    shader.AdditionalImplementation() << "var<workgroup> workgroup_shared : array<output_value_t," << shared_memory_size << ">;\n";
-    shader.MainFunctionBody() << "  let output_indices = " << y.OffsetToIndices(offset) << ";\n"
-                              << "  let col = output_indices[2];\n"
-                                 "  let row = output_indices[1];\n"
-                                 "  let batch = output_indices[0];\n"
-                                 "  let n_blocks_per_col = uniforms.input_b_shape[1];\n"
-                                 "  let blob_size = uniforms.input_b_shape[2];\n"
-                                 "  for (var block = local_id.x; block < n_blocks_per_col; block += workgroup_size_x) {\n"
-                              << "    var word_offset = block * uniforms.block_size / " << a.NumComponents() << ";\n";
-
-    // prepare scale and zero point
-    shader.MainFunctionBody() << "    var col_index = col * " << y.NumComponents() << ";\n";
-    if (has_zero_points_) {
-      const auto& zero_points = shader.AddInput("zero_points", ShaderUsage::UseUniform);
-      shader.MainFunctionBody() << "    let zero_point_bytes_per_col = (n_blocks_per_col + 1) / 2;\n"
-                                   "    var zero_point_byte_count: u32;\n"
-                                   "    var zero_point_word_index: u32;\n"
-                                   "    var zero_point_byte_offset: u32;\n"
-                                   "    let zero_point_nibble_offset: u32 = block & 0x1u;\n"
-                                   "    var zero_point_bits_offset: u32;\n"
-                                   "    var zero_point_word: u32;\n";
-      for (int c = 0; c < output_element_number; c++) {
-        shader.MainFunctionBody() << "    let scale" << c << " = " << scales.GetByOffset("col_index * n_blocks_per_col + block") << ";\n"
-                                  << "    zero_point_byte_count = col_index * zero_point_bytes_per_col + (block >> 0x1u);\n"
-                                     "    zero_point_word_index = zero_point_byte_count >> 0x2u;\n"
-                                     "    zero_point_byte_offset = zero_point_byte_count & 0x3u;\n"
-                                     "    zero_point_bits_offset = (zero_point_byte_offset << 3) + (zero_point_nibble_offset << 2);\n"
-                                  << "    zero_point_word = " << zero_points.GetByOffset("zero_point_word_index") << " >> zero_point_bits_offset;\n"
-                                  << "    let zero_point" << c << " = output_element_t((zero_point_word) & 0xFu);\n"
-                                  << "    col_index += 1;\n";
-      }
-    } else {
-      shader.MainFunctionBody() << "    let zero_point = output_element_t(8.0);\n";
-      for (int c = 0; c < output_element_number; c++) {
-        shader.MainFunctionBody() << "    let scale" << c << " = " << scales.GetByOffset("col_index * n_blocks_per_col + block") << ";\n"
-                                  << "    col_index += 1;\n";
-      }
-    }
-
-    shader.MainFunctionBody() << "    for (var word: u32 = 0; word < blob_size; word += 1) {\n";
-
-    // prepare b data
-    shader.MainFunctionBody() << "      col_index = col * " << y.NumComponents() << ";\n";
-    for (int c = 0; c < output_element_number; c++) {
-      shader.MainFunctionBody() << "      let b" << c << "_data = " << b.GetByIndices("input_b_indices_t(col_index, block, word)") << ";\n"
-                                << "      col_index += 1;\n";
-    }
-    shader.MainFunctionBody() << "      var b_value : u32;\n"
-                                 "      let b_mask : u32 = 0x0F0F0F0Fu;\n"
-                                 "      var b_value_lower : vec4<u32>;\n"
-                                 "      var b_value_upper : vec4<u32>;\n"
-                              << "      var b_quantized_values : " << quantized_data_type << ";\n"
-                              << "      var b_dequantized_values : " << quantized_data_type << ";\n";
-
-    shader.MainFunctionBody() << "      for (var i: u32 = 0; i < " << components_b_ << "; i++) {\n";
-
-    // process one word
-    shader.MainFunctionBody() << "        var input_offset = " << a.IndicesToOffset("input_a_indices_t(batch, row, word_offset)") << ";\n"
-                              << "        var a_data: " << quantized_data_type << ";\n"
-                              << "        for (var j: u32 = 0; j < " << (8 / a.NumComponents()) << "; j++) {\n"
-                              << "          if (word_offset + j < uniforms.input_a_shape[2]) {\n"
-                              << "            a_data[j] = " << a.GetByOffset("input_offset") << ";\n"
-                              << "            input_offset++;\n"
-                                 "          } else {\n"
-                                 "            a_data[j] = input_a_value_t(0);\n"
-                                 "          }\n"
-                                 "        }\n";
-    for (int c = 0; c < output_element_number; c++) {
-      shader.MainFunctionBody() << "        b_value = b" << c << "_data";
-      if (components_b_ > 1) {
-        shader.MainFunctionBody() << "[i]";
-      }
-      shader.MainFunctionBody() << ";\n"
-                                   "        b_value_lower = unpack4xU8(b_value & b_mask);\n"
-                                   "        b_value_upper = unpack4xU8((b_value >> 4) & b_mask);\n"
-                                << "        b_quantized_values = " << quantized_data_type << "(output_element_t(b_value_lower[0]), output_element_t(b_value_upper[0]), output_element_t(b_value_lower[1]), output_element_t(b_value_upper[1]), output_element_t(b_value_lower[2]), output_element_t(b_value_upper[2]), output_element_t(b_value_lower[3]), output_element_t(b_value_upper[3]));\n"
-                                << "        b_dequantized_values = ";
-      if (a.NumComponents() == 1) {
-        if (has_zero_points_) {
-          shader.MainFunctionBody() << quantized_data_type << "((b_quantized_values[0] - zero_point" << c << ") * scale" << c << ", "
-                                    << "(b_quantized_values[1] - zero_point" << c << ") * scale" << c << ", "
-                                    << "(b_quantized_values[2] - zero_point" << c << ") * scale" << c << ", "
-                                    << "(b_quantized_values[3] - zero_point" << c << ") * scale" << c << ", "
-                                    << "(b_quantized_values[4] - zero_point" << c << ") * scale" << c << ", "
-                                    << "(b_quantized_values[5] - zero_point" << c << ") * scale" << c << ", "
-                                    << "(b_quantized_values[6] - zero_point" << c << ") * scale" << c << ", "
-                                    << "(b_quantized_values[7] - zero_point" << c << ") * scale" << c << ");\n";
-        } else {
-          shader.MainFunctionBody() << quantized_data_type << "((b_quantized_values[0] - zero_point) * scale" << c << ", "
-                                    << "(b_quantized_values[1] - zero_point) * scale" << c << ","
-                                    << "(b_quantized_values[2] - zero_point) * scale" << c << ","
-                                    << "(b_quantized_values[3] - zero_point) * scale" << c << ","
-                                    << "(b_quantized_values[4] - zero_point) * scale" << c << ","
-                                    << "(b_quantized_values[5] - zero_point) * scale" << c << ","
-                                    << "(b_quantized_values[6] - zero_point) * scale" << c << ","
-                                    << "(b_quantized_values[7] - zero_point) * scale" << c << ");\n";
-        }
-      } else {
-        shader.MainFunctionBody() << "(b_quantized_values - " << quantized_data_type << "(";
-        for (int i = 0; i < 8; i++) {
-          if (has_zero_points_) {
-            shader.MainFunctionBody() << "zero_point" << c;
-          } else {
-            shader.MainFunctionBody() << "zero_point";
-          }
-          if (i < 7) {
-            shader.MainFunctionBody() << ", ";
-          }
-        }
-        shader.MainFunctionBody() << ")) * scale" << c << ";\n";
-      }
-
-      shader.MainFunctionBody() << "        workgroup_shared[local_id.x * " << output_number_ << " + " << c / y.NumComponents() << "]";
-      if (y.NumComponents() > 1) {
-        shader.MainFunctionBody() << "[" << c % y.NumComponents() << "]";
-      }
-      shader.MainFunctionBody() << " += ";
-      if (a.NumComponents() == 1) {
-        shader.MainFunctionBody() << "a_data[0] * b_dequantized_values[0] + "
-                                     "a_data[1] * b_dequantized_values[1] + "
-                                     "a_data[2] * b_dequantized_values[2] + "
-                                     "a_data[3] * b_dequantized_values[3] + "
-                                     "a_data[4] * b_dequantized_values[4] + "
-                                     "a_data[5] * b_dequantized_values[5] + "
-                                     "a_data[6] * b_dequantized_values[6] + "
-                                     "a_data[7] * b_dequantized_values[7];\n";
-      } else if (a.NumComponents() == 2) {
-        shader.MainFunctionBody() << "dot(a_data[0], b_dequantized_values[0]) + "
-                                     "dot(a_data[1], b_dequantized_values[1]) + "
-                                     "dot(a_data[2], b_dequantized_values[2]) + "
-                                     "dot(a_data[3], b_dequantized_values[3]);\n";
-      } else if (a.NumComponents() == 4) {
-        shader.MainFunctionBody() << "dot(a_data[0], b_dequantized_values[0]) + "
-                                     "dot(a_data[1], b_dequantized_values[1]);\n";
-      }
-    }
-
-    shader.MainFunctionBody() << "        word_offset += " << 8 / a.NumComponents() << ";\n"
-                              << "      }\n"
-                                 "    }\n"
-                                 "  }\n"
-                                 "  workgroupBarrier();\n"
-                              << "  if (local_id.x < " << output_number_ << ") {\n"
-                              << "    var output_value = output_value_t(0);\n"
-                                 "    var workgroup_shared_offset = local_id.x;\n"
-                              << "    let blocks_num = min(" << shared_memory_size << ", n_blocks_per_col);\n"
-                              << "    for (var b = 0u; b < blocks_num; b++) {\n"
-                                 "      output_value += workgroup_shared[workgroup_shared_offset];\n"
-                              << "      workgroup_shared_offset += " << output_number_ << ";\n"
-                              << "    }\n"
-                              << "    " << y.SetByIndices("output_indices_t(batch, row, col + local_id.x)", "output_value") << "\n"
-                              << "  }\n";
+Status MatMulNBitsWideTileProgram::GenerateShaderCode(ShaderHelper& shader) const {
+  const auto& a = shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
+  const auto& b = shader.AddInput("input_b", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
+  const auto& scales = shader.AddInput("scales", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
+  if (has_zero_points_) {
+    shader.AddInput("zero_points", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
   }
+  if (has_bias_) {
+    shader.AddInput("bias", ShaderUsage::UseUniform);
+  }
+  if (has_weight_idx_indirect_) {
+    shader.AddInput("weight_index_indirect", ShaderUsage::UseUniform);
+  }
+  const auto& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
 
-  return Status::OK();
+  const uint32_t workgroup_size = WorkgroupSizeX() * WorkgroupSizeY() * WorkgroupSizeZ();
+  ORT_ENFORCE(tile_n_ == workgroup_size, "tile_n must be workgroup_size.");
+  ORT_ENFORCE(tile_m_ % (workgroup_size / 8) == 0, "tile_m must be a multiple of workgroup_size / 8.");
+  ORT_ENFORCE(nbits_ == 4 || nbits_ == 8, "Only 4/8 bits are supported for webgpu matmulnbits.");
+
+  return WGSL_TEMPLATE_APPLY(shader, "quantization/matmul_nbits_wide_tile.wgsl.template",
+                             WGSL_TEMPLATE_PARAMETER(acc_f32, acc_f32_),
+                             WGSL_TEMPLATE_PARAMETER(has_bias, has_bias_),
+                             WGSL_TEMPLATE_PARAMETER(has_weight_idx, has_weight_idx_),
+                             WGSL_TEMPLATE_PARAMETER(has_weight_idx_indirect, has_weight_idx_indirect_),
+                             WGSL_TEMPLATE_PARAMETER(has_zero_points, has_zero_points_),
+                             WGSL_TEMPLATE_PARAMETER(nbits, nbits_),
+                             WGSL_TEMPLATE_PARAMETER(subgroup_min_size, subgroup_min_size_),
+                             WGSL_TEMPLATE_PARAMETER(tile_m, tile_m_),
+                             WGSL_TEMPLATE_PARAMETER(tile_n, tile_n_),
+                             WGSL_TEMPLATE_VARIABLE(a, a),
+                             WGSL_TEMPLATE_VARIABLE(b, b),
+                             WGSL_TEMPLATE_VARIABLE(output, output),
+                             WGSL_TEMPLATE_VARIABLE(scales, scales));
+}
+
+// Apply similar idea with DP4AMatMulNBitsSmallMProgram algorithm.
+Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
+  const auto& a = shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias);
+  const auto& b = shader.AddInput("input_b");
+  const auto& scales_b = shader.AddInput("scales_b");
+  if (has_zero_points_) {
+    shader.AddInput("zero_points", ShaderUsage::UseUniform);
+  }
+  if (has_bias_) {
+    shader.AddInput("bias", ShaderUsage::UseUniform);
+  }
+  if (has_weight_idx_indirect_) {
+    shader.AddInput("weight_index_indirect", ShaderUsage::UseUniform);
+  }
+  const auto& output = shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
+
+  const uint32_t components_a = a.NumComponents();
+  const uint32_t components_b = b.NumComponents() / 4;  // b is stored as uint32 which includes 4 uint8.
+  const uint32_t tile_size_k_vec = tile_size_k_vec_;
+  const uint32_t elements_in_value_b = components_b * (32 / nbits_);
+  const uint32_t tile_size_k = tile_size_k_vec * elements_in_value_b;
+  const uint32_t a_length_per_tile = tile_size_k / components_a;
+  uint32_t sub_tile_count = WorkgroupSizeX() / tile_size_k_vec;
+
+  return WGSL_TEMPLATE_APPLY(shader, "quantization/matmul_nbits.wgsl.template",
+                             WGSL_TEMPLATE_PARAMETER(a_length_per_tile, a_length_per_tile),
+                             WGSL_TEMPLATE_PARAMETER(acc_f32, acc_f32_),
+                             WGSL_TEMPLATE_PARAMETER(broadcast_a_row, broadcast_a_row_),
+                             WGSL_TEMPLATE_PARAMETER(component_a, components_a),
+                             WGSL_TEMPLATE_PARAMETER(component_b, components_b),
+                             WGSL_TEMPLATE_PARAMETER(elements_in_value_b, elements_in_value_b),
+                             WGSL_TEMPLATE_PARAMETER(has_bias, has_bias_),
+                             WGSL_TEMPLATE_PARAMETER(has_weight_idx, has_weight_idx_),
+                             WGSL_TEMPLATE_PARAMETER(has_weight_idx_indirect, has_weight_idx_indirect_),
+                             WGSL_TEMPLATE_PARAMETER(has_zero_points, has_zero_points_),
+                             WGSL_TEMPLATE_PARAMETER(n_bits, nbits_),
+                             WGSL_TEMPLATE_PARAMETER(output_type_i32, false),
+                             WGSL_TEMPLATE_PARAMETER(single_scale_weights, single_scale_weights_),
+                             WGSL_TEMPLATE_PARAMETER(sub_tile_count, sub_tile_count),
+                             WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
+                             WGSL_TEMPLATE_PARAMETER(tile_size_k, tile_size_k),
+                             WGSL_TEMPLATE_PARAMETER(tile_size_k_vec, tile_size_k_vec),
+                             WGSL_TEMPLATE_VARIABLE(a, a),
+                             WGSL_TEMPLATE_VARIABLE(b, b),
+                             WGSL_TEMPLATE_VARIABLE(output, output),
+                             WGSL_TEMPLATE_VARIABLE(scales_b, scales_b));
 }
 
 Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
@@ -328,63 +123,249 @@ Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context
   const Tensor* bias = context.Input(5);
 
   ORT_ENFORCE(g_idx == nullptr, "group_idx as input is not supported yet.");
-  ORT_ENFORCE(bias == nullptr, "bias as input is not supported yet.");
+
+  const bool has_zero_points = zero_points != nullptr;
+  if (has_zero_points) {
+    ORT_ENFORCE(zero_points->DataType() == DataTypeImpl::GetType<uint8_t>(), "Currently, only uint8 is supported for zero points, but got ", zero_points->DataType());
+  }
 
   MatMulComputeHelper helper;
   TensorShape b_shape({N_, K_});
   ORT_RETURN_IF_ERROR(helper.Compute(a->Shape(), b_shape, false, true));
-  auto* y = context.Output(0, helper.OutputShape());
-  const uint32_t data_size = gsl::narrow<uint32_t>(y->Shape().Size());
+  auto output_shape = helper.OutputShape();
+  Tensor* y = context.Output(0, output_shape);
+  const uint32_t data_size = onnxruntime::narrow<uint32_t>(y->Shape().Size());
   if (data_size == 0) {
     return Status::OK();
   }
 
-  const uint32_t batch_count = gsl::narrow<uint32_t>(helper.OutputOffsets().size());
-  const uint32_t M = gsl::narrow<uint32_t>(helper.M());
-  const uint32_t N = gsl::narrow<uint32_t>(helper.N());
-  const uint32_t K = gsl::narrow<uint32_t>(helper.K());
-  const uint32_t block_size = gsl::narrow<uint32_t>(block_size_);
-  constexpr uint32_t nbits = 4;
+  return ApplyMatMulNBits(a, b, scales, zero_points, bias, K_, N_, block_size_, accuracy_level_, bits_, context, y, 0);
+}
 
-  const uint32_t n_blocks_per_col = (K + block_size - 1) / block_size;
-  const uint32_t blob_size = (block_size / 8) * nbits;
+/**
+ * @brief Applies a quantized matrix multiplication using N-bit precision.
+ *
+ * This function computes the matrix multiplication of the quantized tensor inputs with multiple
+ * optional optimizations tailored to the GPU backend. Depending on the provided parameters and GPU
+ * capabilities, it selects one of several optimized kernels (such as subgroup matrix multiplication,
+ * DP4A, wide tile programs, or the default matmul program) to perform the computation.
+ * It can be called by the MatMulNBits operator or directly for custom scenarios like QMoe.
+ *
+ * @param a              Pointer to the left-hand side (activation) tensor.
+ * @param b              Pointer to the quantized weight tensor.
+ *                       b has the shape (N, k_blocks, blob_size) or (weight_batch, N, k_blocks, blob_size)
+ * @param scales         Pointer to the tensor containing scaling factors for quantization.
+ *                       scales has the shape (N) or (weight_batch, N)
+ * @param zero_points    Pointer to the zero-point tensor for quantization; must be of type uint8 if provided.
+ *                       weight_index > 0 is only supported when zero_points is nullptr.
+ * @param bias           Pointer to the bias tensor; optional.
+ * @param K_op           The K dimension of the operation (number of columns in 'a' and rows in 'b' before quantization).
+ * @param N_op           The N dimension of the operation (number of columns in 'b').
+ * @param block_size_op  The block size used for quantization partitioning.
+ * @param accuracy_level Accuracy level influencing the choice of optimized kernel.
+ * @param nbits          Number of bits used for quantization.
+ * @param weight_index   Index of the weight matrix in case of stacked weights; defaults to 0.
+ * @param context        Compute context for WebGPU, providing device-specific information and execution facilities.
+ * @param y              Pointer to the output tensor that will hold the result.
+ *
+ * @return Status indicating whether the operation was successful or if an error occurred.
+ *
+ * @note Special optimizations are considered:
+ *       - Subgroup matrix multiplication for GPUs with supported configs.
+ *       - DP4A-based multiplication on FP32-only GPUs for specific dimensions and conditions.
+ *       - A wide tile program is used when block size, component count, and other criteria are met.
+ *       - Otherwise, a default matmul program is used.
+ */
+Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales, const Tensor* zero_points, const Tensor* bias,
+                        int64_t K_op,
+                        int64_t N_op,
+                        int64_t block_size_op,
+                        int64_t accuracy_level,
+                        int64_t nbits,
+                        onnxruntime::webgpu::ComputeContext& context,
+                        Tensor* y,
+                        const uint32_t weight_index,
+                        const Tensor* weight_index_indirect,
+                        uint32_t override_M) {
+  TensorShape b_shape({N_op, K_op});
+  MatMulComputeHelper helper;
+  ORT_RETURN_IF_ERROR(helper.Compute(a->Shape(), b_shape, false, true));
+
+  const bool has_bias = bias != nullptr;
+  const bool has_weight_idx_indirect = weight_index_indirect != nullptr;
+  const bool has_weight_idx = weight_index > 0 || has_weight_idx_indirect;
+  const bool has_zero_points = zero_points != nullptr;
+  if (has_zero_points) {
+    ORT_ENFORCE(zero_points->DataType() == DataTypeImpl::GetType<uint8_t>(), "Currently, only uint8 is supported for zero points, but got ", zero_points->DataType());
+  }
+
+  const uint32_t batch_count = onnxruntime::narrow<uint32_t>(helper.OutputOffsets().size());
+  const uint32_t M = onnxruntime::narrow<uint32_t>(helper.M());
+  const uint32_t dispatch_M = (override_M > 0) ? override_M : M;
+  const bool broadcast_a = dispatch_M > M;
+  const uint32_t N = onnxruntime::narrow<uint32_t>(helper.N());
+  const uint32_t K = onnxruntime::narrow<uint32_t>(helper.K());
+  const uint32_t block_size = onnxruntime::narrow<uint32_t>(block_size_op);
+
+  // Special case matrix used by bitnets where there is a single scale for the entire
+  const bool single_scale_weights = (block_size == K * N);
+  const uint32_t block_size_per_col = single_scale_weights ? K : block_size;
+  const uint32_t n_blocks_per_col = (K + block_size_per_col - 1) / block_size_per_col;
+  const uint32_t blob_size = (block_size_per_col / 8) * static_cast<uint32_t>(nbits);
   const uint32_t blob_size_in_words = blob_size / 4;
   const uint32_t components_a = GetMaxComponents(K);
   const uint32_t components_b = GetMaxComponents(blob_size_in_words);
   uint32_t components = GetMaxComponents(N);
-  const bool is_intel = !std::strcmp(context.AdapterInfo().vendor, "intel") && !std::strcmp(context.AdapterInfo().architecture, "gen-12lp");
-  const bool use_block32 = is_intel && block_size == 32;
-  const bool has_zero_points = zero_points != nullptr;
-  // TODO: Support output_number > 1. Some cases are failed when output_number > 1.
-  // const uint32_t output_number = M > 1 && (N / components) % 2 == 0 ? 2 : 1;
-  constexpr uint32_t output_number = 1;
-  MatMulNBitsProgram program{output_number, gsl::narrow<int>(components_b), has_zero_points, use_block32};
+  // zero_points has shape[N * CeilDiv(n_blocks_per_col * bits, 8)].
+  // The shader uses a flat linear index to address individual n-bit zero point values.
+  // Since each column's zero points are byte-aligned in the packed buffer, we must round
+  // n_blocks_per_col up to the next multiple of (8/nbits) — the number of zero point
+  // values per byte — so that the linear stride correctly skips byte-boundary padding.
+  const uint32_t zp_elements_per_byte = 8 / static_cast<uint32_t>(nbits);
+  uint32_t zero_blocks_per_col = (n_blocks_per_col + zp_elements_per_byte - 1) / zp_elements_per_byte * zp_elements_per_byte;
 
-  if (use_block32) {
-    components = 1;
-    constexpr uint32_t workgroup_size = 128;
-    const uint32_t workgroup_y = N % 8 == 0 ? 8 : N % 4 == 0 ? 4
-                                                             : 1;
-    const uint32_t workgroup_x = workgroup_size / workgroup_y;
-    program.SetWorkgroupSize(workgroup_x, workgroup_y, 1);
-    program.SetDispatchGroupSize(data_size / components / workgroup_y);
-  } else {
-    program.SetDispatchGroupSize(data_size / components / output_number);
+  // apple|intel - Experimental dawn support for subgroup matrix matmul.
+  int32_t subgroup_matrix_config_index = -1;
+  if (CanApplySubgroupMatrixMatMulNBits(context,
+                                        accuracy_level,
+                                        block_size,
+                                        batch_count,
+                                        N,
+                                        K,
+                                        static_cast<uint32_t>(nbits),
+                                        y->DataType() == DataTypeImpl::GetType<MLFloat16>(),
+                                        subgroup_matrix_config_index,
+                                        M,
+                                        has_weight_idx_indirect)) {
+    return ApplySubgroupMatrixMatMulNBits(a, b, scales, zero_points, bias, M, N, K, static_cast<uint32_t>(nbits), zero_blocks_per_col, subgroup_matrix_config_index, context, y, weight_index, weight_index_indirect);
   }
 
-  TensorShape reshaped_a_shape{batch_count, M, K / components_a};
-  TensorShape reshaped_b_shape{N, n_blocks_per_col, blob_size_in_words / components_b};
-  TensorShape reshaped_y_shape{batch_count, M, N / components};
+  // On FP32 only GPUs and Qualcomm GPUs, integer math is faster than FP32 therefore always use DP4A independent of length of M.
+  // DP4A Q2 path now supports custom zero points via a 1024-entry LUT (4 zero-point sections × 256 byte values).
+  if (CanApplyDP4AMatrixMatMulNBits(context, accuracy_level, block_size, N, K, components_a,
+                                    M, has_weight_idx_indirect, y)) {
+    return ApplyDP4AMatrixMatMulNBits(a, b, scales, zero_points, bias, batch_count, M, dispatch_M, N, K, block_size, zero_blocks_per_col, kMinMForTileOptimization, static_cast<uint32_t>(nbits), context, y, weight_index, weight_index_indirect);
+  }
 
+  // WideTileProgram
+  // This program is optimized for Block32 prefill.
+  const bool use_wide_tile_program = CanApplyWideTileMatMulNBits(M,
+                                                                 K,
+                                                                 block_size,
+                                                                 nbits,
+                                                                 has_weight_idx_indirect,
+                                                                 components_a,
+                                                                 components_b);
+
+  const bool acc_f32 = context.EnableMatmulFp32Accumulation();
+
+  if (use_wide_tile_program) {
+    // Enforce output components to 1.
+    components = 1;
+
+    constexpr uint32_t workgroup_size = 128;
+    constexpr uint32_t tile_n = workgroup_size;
+    const bool is_f16 = a->DataType() == DataTypeImpl::GetType<MLFloat16>();
+    const uint32_t tile_m = is_f16 ? 2 * workgroup_size / 8 : workgroup_size / 8;
+    const uint32_t num_N_tile = CeilDiv(N, tile_n);
+    const uint32_t num_M_tile = CeilDiv(dispatch_M, tile_m);
+
+    bool is_nvidia = context.AdapterInfo().vendor == std::string_view{"nvidia"};
+
+    // The template shuffles tile_m lanes in bands of subgroup_min_size when that's a
+    // width it supports; otherwise (including when Subgroups isn't supported) it falls
+    // back to a direct reduction.
+    // NOTE: NVIDIA GPUs prefer direct reduction.
+    const uint32_t subgroup_min_size = (context.HasFeature(wgpu::FeatureName::Subgroups) && !is_nvidia)
+                                           ? context.AdapterInfo().subgroupMinSize
+                                           : 0u;
+
+    MatMulNBitsWideTileProgram program{has_zero_points, has_bias, has_weight_idx, has_weight_idx_indirect, tile_m, tile_n, static_cast<uint32_t>(nbits), subgroup_min_size, acc_f32};
+    program.SetWorkgroupSize(workgroup_size);
+    program.SetDispatchGroupSize(num_N_tile, num_M_tile, batch_count);
+
+    constexpr uint32_t kU32Components = 4;
+    const uint32_t components_b_with_u32 = components_b * kU32Components;
+    const uint32_t K_of_b = n_blocks_per_col * blob_size / components_b_with_u32;
+    const uint32_t K_of_a = K / components_a;
+
+    program.AddInput({a,
+                      ProgramTensorMetadataDependency::TypeAndRank,
+                      onnxruntime::narrow<int>(components_a)});
+    program.AddInput({b,
+                      ProgramTensorMetadataDependency::TypeAndRank,
+                      onnxruntime::narrow<int>(components_b_with_u32)});
+    program.AddInput({scales, ProgramTensorMetadataDependency::TypeAndRank});
+    if (has_zero_points) {
+      program.AddInput({zero_points,
+                        ProgramTensorMetadataDependency::TypeAndRank,
+                        {CeilDiv(zero_points->Shape().Size(), static_cast<int64_t>(4))},
+                        4});
+    }
+    if (has_bias) {
+      program.AddInput({bias, ProgramTensorMetadataDependency::None});
+    }
+    if (has_weight_idx_indirect) {
+      program.AddInput({weight_index_indirect, ProgramTensorMetadataDependency::None});
+    }
+    program.AddOutput({y,
+                       ProgramTensorMetadataDependency::TypeAndRank,
+                       onnxruntime::narrow<int>(components)});
+    program.AddUniformVariables({{batch_count},
+                                 {dispatch_M},
+                                 {N},
+                                 {K_of_a},
+                                 {K_of_b},
+                                 {n_blocks_per_col},
+                                 {zero_blocks_per_col},
+                                 {num_N_tile},
+                                 {num_M_tile},
+                                 {weight_index}});
+    program.CacheHint(nbits, has_zero_points, has_bias, has_weight_idx, has_weight_idx_indirect, subgroup_min_size, acc_f32);
+
+    return context.RunProgram(program);
+  }
+
+  // Use tile_size_k_vec=32 by default for better K-dimension parallelism.
+  // Intel devices use 16 as they have different subgroup/cache characteristics.
+  const uint32_t tile_size_k_vec =
+      (context.AdapterInfo().vendor == std::string_view{"intel"}) ? 16u : 32u;
+
+  constexpr uint32_t workgroup_size = 128;
+  constexpr uint32_t tile_size = 8;
+  constexpr uint32_t kU32Components = 4;
+  uint32_t components_b_with_u32 = components_b * kU32Components;
+  uint32_t K_of_b = (n_blocks_per_col * blob_size) / components_b_with_u32;
+  MatMulNBitsProgram program{tile_size, static_cast<uint32_t>(nbits), has_zero_points, has_bias, has_weight_idx, has_weight_idx_indirect, single_scale_weights, tile_size_k_vec, broadcast_a, acc_f32};
+  program.SetWorkgroupSize(workgroup_size);
+  uint32_t num_N_tile = (N + tile_size - 1) / tile_size;
+  program.SetDispatchGroupSize(num_N_tile, dispatch_M, batch_count);
   program
-      .AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, reshaped_a_shape, gsl::narrow<int>(components_a)},
-                  {b, ProgramTensorMetadataDependency::TypeAndRank, reshaped_b_shape, gsl::narrow<int>(components_b * 4 /** b will be accessed as uint32 which includs 4 uint8. So here we need to multiply 4.*/)},
-                  {scales, ProgramTensorMetadataDependency::None}})
-      .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank, reshaped_y_shape, gsl::narrow<int>(components)})
-      .AddUniformVariable({block_size})
-      .CacheHint(std::to_string(output_number));
+      .AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(components_a)},
+                  {b, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(components_b_with_u32)},
+                  {scales, ProgramTensorMetadataDependency::TypeAndRank}})
+      .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank})
+      .AddUniformVariables({{M},
+                            {N},
+                            {K},
+                            {K / components_a},
+                            {K_of_b},
+                            {block_size},
+                            {n_blocks_per_col},
+                            {zero_blocks_per_col},
+                            {num_N_tile},
+                            {batch_count},
+                            {weight_index},
+                            {dispatch_M}})
+      .CacheHint(nbits, has_zero_points, single_scale_weights, has_bias, has_weight_idx, has_weight_idx_indirect, tile_size_k_vec, broadcast_a, acc_f32);
   if (has_zero_points) {
     program.AddInput({zero_points, ProgramTensorMetadataDependency::None, {(zero_points->Shape().Size() + 3) / 4}, 4});
+  }
+  if (has_bias) {
+    program.AddInput({bias, ProgramTensorMetadataDependency::None});
+  }
+  if (has_weight_idx_indirect) {
+    program.AddInput({weight_index_indirect, ProgramTensorMetadataDependency::None});
   }
   return context.RunProgram(program);
 }

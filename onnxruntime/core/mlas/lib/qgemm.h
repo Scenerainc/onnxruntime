@@ -867,7 +867,8 @@ MlasGemmQuantGetDispatch(
 {
     const MLAS_GEMM_QUANT_DISPATCH* GemmQuantDispatch = &MlasGemmQuantDispatchDefault;
 
-#if defined(MLAS_TARGET_AMD64_IX86) || defined(MLAS_TARGET_LARCH64)
+#if !defined(FORCE_GENERIC_ALGORITHMS)
+#if defined(MLAS_TARGET_AMD64_IX86)
     if (AIsSigned) {
         GemmQuantDispatch =
             BIsSigned ? GetMlasPlatform().GemmS8S8Dispatch : GetMlasPlatform().GemmS8U8Dispatch;
@@ -878,12 +879,20 @@ MlasGemmQuantGetDispatch(
 #elif defined(MLAS_TARGET_ARM64)
     if(BIsSigned) {
         GemmQuantDispatch = AIsSigned ? GetMlasPlatform().GemmS8S8Dispatch : GetMlasPlatform().GemmU8S8Dispatch;
-    } else if(!AIsSigned) {
-        GemmQuantDispatch = GetMlasPlatform().GemmU8U8Dispatch;
+    } else {
+        GemmQuantDispatch = AIsSigned ? GetMlasPlatform().GemmS8U8Dispatch : GetMlasPlatform().GemmU8U8Dispatch;
     }
 #elif defined(MLAS_TARGET_ARM64EC) || (defined(MLAS_TARGET_ARM) && !defined(_MSC_VER))
     if(BIsSigned || !AIsSigned) {
         GemmQuantDispatch = &MlasGemmU8X8DispatchNeon;
+    }
+#elif defined(MLAS_TARGET_WASM_RELAXED_SIMD)
+    if (!AIsSigned) {
+        if (HasUSDot()) {
+          GemmQuantDispatch = &MlasGemmU8X8DispatchWasmRelaxedSimd;
+        } else {
+          GemmQuantDispatch = &MlasGemmU8X8DispatchWasmSimd;
+        }
     }
 #elif defined(MLAS_TARGET_WASM_SIMD)
     if (!AIsSigned) {
@@ -895,7 +904,28 @@ MlasGemmQuantGetDispatch(
     if (GetMlasPlatform().GemmU8X8Dispatch == &MlasGemm8X8DispatchPOWER10) {
         GemmQuantDispatch = GetMlasPlatform().GemmU8X8Dispatch;
     }
+#elif defined(MLAS_TARGET_LARCH64)
+    if (AIsSigned) {
+        GemmQuantDispatch =
+            BIsSigned ? GetMlasPlatform().GemmS8S8Dispatch : GetMlasPlatform().GemmS8U8Dispatch;
+    } else { // !AIsSigned
+        GemmQuantDispatch =
+            BIsSigned ? GetMlasPlatform().GemmU8S8Dispatch : GetMlasPlatform().GemmU8U8Dispatch;
+    }
+#elif defined(MLAS_TARGET_RISCV64)
+    if (AIsSigned) {
+        GemmQuantDispatch =
+            BIsSigned ? GetMlasPlatform().GemmS8S8Dispatch : GetMlasPlatform().GemmS8U8Dispatch;
+    } else { // !AIsSigned
+        GemmQuantDispatch =
+            BIsSigned ? GetMlasPlatform().GemmU8S8Dispatch : GetMlasPlatform().GemmU8U8Dispatch;
+    }
+#elif defined(MLAS_TARGET_S390X)
+    if (GetMlasPlatform().GemmU8X8Dispatch == &MlasGemm8X8DispatchZVECTOR) {
+        GemmQuantDispatch = GetMlasPlatform().GemmU8X8Dispatch;
+    }
 #endif
+#endif // !defined(FORCE_GENERIC_ALGORITHMS)
 
     if (nullptr == GemmQuantDispatch) {
         std::stringstream ss;

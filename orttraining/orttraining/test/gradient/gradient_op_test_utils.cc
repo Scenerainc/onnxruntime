@@ -59,7 +59,6 @@ void GradientOpTester::Run(int output_index_to_use_as_loss,
     static const std::string all_provider_types[] = {
         kCpuExecutionProvider,
         kCudaExecutionProvider,
-        kRocmExecutionProvider,
         kDnnlExecutionProvider,
         kTensorrtExecutionProvider,
     };
@@ -114,8 +113,7 @@ void GradientOpTester::Run(int output_index_to_use_as_loss,
           execution_provider = DefaultDnnlExecutionProvider();
         else if (provider_type == onnxruntime::kTensorrtExecutionProvider)
           execution_provider = DefaultTensorrtExecutionProvider();
-        else if (provider_type == onnxruntime::kRocmExecutionProvider)
-          execution_provider = DefaultRocmExecutionProvider();
+
         // skip if execution provider is disabled
         if (execution_provider == nullptr)
           continue;
@@ -139,7 +137,8 @@ void GradientOpTester::Run(int output_index_to_use_as_loss,
 
           auto reg = execution_provider->GetKernelRegistry();
           const KernelCreateInfo* kci;
-          auto st = reg->TryFindKernel(node, execution_provider->Type(), kernel_type_str_resolver, &kci);
+          auto st = reg->TryFindKernel(node, execution_provider->Type(), kernel_type_str_resolver,
+                                       DefaultLoggingManager().DefaultLogger(), &kci);
           if (!st.IsOK()) {
             // The goal here is unclear. It seems best to leave it to the Session
             // creation to figure out whether the model can be executed using some

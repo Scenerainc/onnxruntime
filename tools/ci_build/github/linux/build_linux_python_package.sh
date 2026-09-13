@@ -6,65 +6,66 @@ set -e -x
 mkdir -p /build/dist
 
 EXTRA_ARG=""
-ENABLE_CACHE=false
-# Put 3.10 at the last because Ubuntu 22.04 use python 3.10 and we will upload the intermediate build files of this 
-# config to Azure DevOps Artifacts and download them to a Ubuntu 22.04 machine to run the tests.
-PYTHON_EXES=("/opt/python/cp311-cp311/bin/python3.11" "/opt/python/cp312-cp312/bin/python3.12" "/opt/python/cp313-cp313/bin/python3.13" "/opt/python/cp313-cp313t/bin/python3.13t" "/opt/python/cp310-cp310/bin/python3.10")
-while getopts "d:p:x:c:e" parameter_Option
+# Put 3.12 at the last because Ubuntu 24.04 use python 3.12 and we will upload the intermediate build files of this
+# config to Azure DevOps Artifacts and download them to a Ubuntu 24.04 machine to run the tests.
+PYTHON_EXES=(
+  "/opt/python/cp311-cp311/bin/python3.11"
+  "/opt/python/cp313-cp313/bin/python3.13"
+  "/opt/python/cp313-cp313t/bin/python3.13"
+  "/opt/python/cp314-cp314/bin/python3.14"
+  "/opt/python/cp314-cp314t/bin/python3.14"
+  "/opt/python/cp312-cp312/bin/python3.12"
+  )
+
+while getopts "d:p:x:c:a:" parameter_Option
 do case "${parameter_Option}"
 in
-#GPU|CPU|NPU.
+#GPU|WEBGPU|CPU|NPU.
 d) BUILD_DEVICE=${OPTARG};;
-p) PYTHON_EXES=${OPTARG};;
+p)
+  # Check if OPTARG is empty or starts with a hyphen, indicating a missing or invalid argument for -p
+  if [[ -z "${OPTARG}" || "${OPTARG}" == -* ]]; then
+    echo "ERROR: Option -p requires a valid argument, not another option."
+    exit 1
+  else
+    PYTHON_EXES=("${OPTARG}") # Use the provided argument for -p
+  fi
+  ;;
 x) EXTRA_ARG=${OPTARG};;
 c) BUILD_CONFIG=${OPTARG};;
-e) ENABLE_CACHE=true;;
-*) echo "Usage: $0 -d <GPU|CPU|NPU> [-p <python_exe_path>] [-x <extra_build_arg>] [-c <build_config>]"
+a) CUDA_ARCHS=${OPTARG};;
+*) echo "Usage: $0 -d <GPU|WEBGPU|CPU|NPU> [-p <python_exe_path>] [-x <extra_build_arg>] [-c <build_config>] [-a <cuda_archs>]"
    exit 1;;
 esac
 done
 
-
-
-BUILD_ARGS=("--build_dir" "/build" "--config" "$BUILD_CONFIG" "--update" "--build" "--skip_submodule_sync" "--parallel" "--use_binskim_compliant_compile_flags" "--build_wheel")
+BUILD_ARGS=("--build_dir" "/build" "--config" "$BUILD_CONFIG" "--update" "--build" "--skip_submodule_sync" "--use_binskim_compliant_compile_flags" "--build_wheel" "--use_vcpkg" "--use_vcpkg_ms_internal_asset_cache")
 
 if [ "$BUILD_CONFIG" != "Debug" ]; then
     BUILD_ARGS+=("--enable_lto")
 fi
-if [ "$ENABLE_CACHE" = true ] ; then
-    BUILD_ARGS+=("--use_cache")
-    # No release binary for ccache aarch64, so we need to build it from source.
-    if ! [ -x "$(command -v ccache)" ]; then
-        ccache_url="https://github.com/ccache/ccache/archive/refs/tags/v4.8.tar.gz"
-        cd /build
-        curl -sSL --retry 5 --retry-delay 10 --create-dirs --fail -L -o ccache_src.tar.gz $ccache_url
-        mkdir ccache_main
-        cd ccache_main
-        tar -zxf ../ccache_src.tar.gz --strip=1
 
-        mkdir build
-        cd build
-        cmake -DCMAKE_INSTALL_PREFIX=/build -DCMAKE_BUILD_TYPE=Release ..
-        make -j$(nproc)
-        make install
-        export PATH=/build/bin:$PATH
-        which ccache
-        rm -f ccache_src.tar.gz
-        rm -rf ccache_src
-    fi
-    ccache -s;
+if command -v ccache &> /dev/null; then
+    ccache --zero-stats
+    BUILD_ARGS+=("--use_cache")
 fi
 
 ARCH=$(uname -m)
 
-
-
+if [ "$ARCH" == "aarch64" ] && [ "$BUILD_DEVICE" == "GPU" ]; then
+  # Each CUDA compiler process handles all requested architectures and can use several GB.
+  BUILD_ARGS+=("--parallel" "8")
+else
+  BUILD_ARGS+=("--parallel")
+fi
 
 echo "EXTRA_ARG:"
 echo "$EXTRA_ARG"
 
 if [ "$EXTRA_ARG" != "" ]; then
-    BUILD_ARGS+=("$EXTRA_ARG")
+    # SC2206: This is intentionally unquoted to allow multiple arguments.
+    # shellcheck disable=SC2206
+    BUILD_ARGS+=($EXTRA_ARG)
 fi
 
 if [ "$ARCH" == "x86_64" ]; then
@@ -73,14 +74,46 @@ if [ "$ARCH" == "x86_64" ]; then
 fi
 
 if [ "$BUILD_DEVICE" == "GPU" ]; then
-    SHORT_CUDA_VERSION=$(echo $CUDA_VERSION | sed   's/\([[:digit:]]\+\.[[:digit:]]\+\)\.[[:digit:]]\+/\1/')
-    #Enable CUDA and TRT EPs.
-    BUILD_ARGS+=("--use_cuda" "--use_tensorrt" "--cuda_version=$SHORT_CUDA_VERSION" "--tensorrt_home=/usr" "--cuda_home=/usr/local/cuda-$SHORT_CUDA_VERSION" "--cudnn_home=/usr/local/cuda-$SHORT_CUDA_VERSION" "--cmake_extra_defines" "CMAKE_CUDA_ARCHITECTURES=52;60;61;70;75;80")
+    # The caller (-a) normally supplies these. Keep in sync with plugin-cuda-pipeline.yml
+    # (cmake_linux_x64_cuda_archs / cmake_linux_aarch64_cuda_archs).
+    if [ -z "${CUDA_ARCHS:-}" ]; then
+        if [ "$CUDA_VERSION" == "13.0" ] && [ "$ARCH" == "aarch64" ]; then
+            CUDA_ARCHS="89-real;90-real;120-real;121-real"
+        elif [ "$CUDA_VERSION" == "12.8" ]; then
+            CUDA_ARCHS="60-real;70-real;75-real;80-real;86-real;89-real;90-real;120-real"
+        elif [ "$CUDA_VERSION" == "13.0" ]; then
+            CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;120-real"
+        else
+            echo "Error: Unrecognized CUDA_VERSION: $CUDA_VERSION"
+            exit 1
+        fi
+    fi
+
+    SHORT_CUDA_VERSION=$(echo "$CUDA_VERSION" | sed   's/\([[:digit:]]\+\.[[:digit:]]\+\)\.[[:digit:]]\+/\1/')
+    CUDA_HOME=/usr/local/cuda-$SHORT_CUDA_VERSION
+    if [ ! -d "$CUDA_HOME" ] && [ -d /usr/local/cuda ]; then
+        # Allow the cu13 packaging flow to run on images that expose a newer CUDA minor version via /usr/local/cuda.
+        CUDA_HOME=/usr/local/cuda
+    fi
+    #Enable CUDA EP.
+    BUILD_ARGS+=("--use_cuda" "--cuda_version=$SHORT_CUDA_VERSION" "--cuda_home=$CUDA_HOME" "--cudnn_home=$CUDA_HOME")
+    BUILD_ARGS+=("--nvcc_threads=1" "--flash_nvcc_threads=1")
+    BUILD_ARGS+=("--cmake_extra_defines" "CMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" "onnxruntime_USE_FPA_INTB_GEMM=ON")
+    # Enable TRT EP only if TensorRT is installed.
+    if [ -f /usr/include/NvInfer.h ]; then
+        BUILD_ARGS+=("--use_tensorrt" "--tensorrt_home=/usr")
+    elif [ "$ARCH" != "aarch64" ] && [ -f /opt/tensorrt/include/NvInfer.h ]; then
+        # The aarch64 TensorRT tarball is not compatible with the packaging image's glibc baseline.
+        BUILD_ARGS+=("--use_tensorrt" "--tensorrt_home=/opt/tensorrt")
+    fi
+fi
+if [ "$BUILD_DEVICE" == "WEBGPU" ]; then
+    BUILD_ARGS+=("--use_webgpu")
 fi
 
 if [ "$BUILD_DEVICE" == "NPU" ]; then
     #Enable QNN EP
-    BUILD_ARGS+=("--use_qnn" "--qnn_home=/qnn_sdk")
+    BUILD_ARGS+=("--build_shared_lib" "--use_qnn" "--qnn_home=/qnn_sdk")
 fi
 
 export ONNX_ML=1
@@ -88,13 +121,31 @@ export CMAKE_ARGS="-DONNX_GEN_PB_TYPE_STUBS=ON -DONNX_WERROR=OFF"
 
 for PYTHON_EXE in "${PYTHON_EXES[@]}"
 do
-  rm -rf /build/"$BUILD_CONFIG"
-  ${PYTHON_EXE} -m pip install -r /onnxruntime_src/tools/ci_build/github/linux/python/requirements.txt  
-  ${PYTHON_EXE} /onnxruntime_src/tools/ci_build/build.py "${BUILD_ARGS[@]}"
+  # Check if the Python executable or its directory exists
+  if [ ! -f "$PYTHON_EXE" ]; then
+    echo "WARNING: Python executable not found at $PYTHON_EXE. Skipping this version."
+    continue
+  fi
 
+  # Recompile the entire onnxruntime from scratch for every single Python version.
+  # TODO: It might be possible to reuse some intermediate files between different Python versions to speed up the build.
+  rm -rf /build/"$BUILD_CONFIG"
+
+  # that's a workaround for the issue that there's no python3 in the docker image
+  # like xnnpack's cmakefile, it uses pythone3 to run a external command
+  python3_dir=$(dirname "$PYTHON_EXE")
+  ls "$python3_dir"
+  PIP_REQUIREMENTS=(-r /onnxruntime_src/tools/ci_build/github/linux/python/requirements.txt)
+  if [[ "${PYTHON_EXE}" == */cp313-cp313t/* ]]; then
+    # mypy 1.19+ dependencies do not support free-threaded CPython 3.13.
+    PIP_REQUIREMENTS+=("mypy<1.19")
+  fi
+  "${PYTHON_EXE}" -m pip install "${PIP_REQUIREMENTS[@]}"
+  PATH=$python3_dir:$PATH ${PYTHON_EXE} /onnxruntime_src/tools/ci_build/build.py "${BUILD_ARGS[@]}"
   cp /build/"$BUILD_CONFIG"/dist/*.whl /build/dist
 done
 
-if [ "$ENABLE_CACHE" = true ] ; then
-  which ccache && ccache -sv && ccache -z
+if command -v ccache &> /dev/null; then
+  # FIXME: can't use `-vv` for extra details b/c we're shipping with a decrepit version of ccache (3.something) that doesn't support it.
+  ccache --show-stats # -vv
 fi

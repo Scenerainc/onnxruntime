@@ -14,7 +14,6 @@
 # limitations under the License.
 """BERT finetuning runner."""
 
-
 import argparse
 
 # ==================
@@ -47,6 +46,18 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s", datefmt="%m/%d/%Y %H:%M:%S", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+
+def _torch_load_weights_only(path, **kwargs):
+    try:
+        return torch.load(path, weights_only=True, **kwargs)
+    except TypeError:
+        logger.warning(
+            "Current PyTorch version does not support torch.load(..., weights_only=True); "
+            "falling back to default torch.load behavior for %s.",
+            path,
+        )
+        return torch.load(path, **kwargs)
 
 
 def create_pretraining_dataset(input_file, max_pred_length, shared_list, args):
@@ -272,7 +283,9 @@ def prepare_model_and_optimizer(args, device):
             args.resume_step = max([int(x.split(".pt")[0].split("_")[1].strip()) for x in model_names])
         global_step = args.resume_step
 
-        checkpoint = torch.load(os.path.join(args.output_dir, f"ckpt_{global_step}.pt"), map_location="cpu")
+        checkpoint = _torch_load_weights_only(
+            os.path.join(args.output_dir, f"ckpt_{global_step}.pt"), map_location="cpu"
+        )
         model.load_state_dict(checkpoint["model"], strict=False)
         if args.phase2:
             global_step -= args.phase1_end_step
@@ -337,7 +350,7 @@ def prepare_model_and_optimizer(args, device):
             optimizer._lazy_init_maybe_master_weights()
             optimizer._amp_stash.lazy_init_called = True
             optimizer.load_state_dict(checkpoint["optimizer"])
-            for param, saved_param in zip(amp.master_params(optimizer), checkpoint["master params"]):
+            for param, saved_param in zip(amp.master_params(optimizer), checkpoint["master params"], strict=False):
                 param.data.copy_(saved_param.data)
 
     if args.local_rank != -1:
@@ -555,7 +568,7 @@ def main():
                         )
                         is_model_exported = False
 
-                        import onnxruntime as ort
+                        import onnxruntime as ort  # noqa: PLC0415
 
                         sess = ort.InferenceSession(onnx_path, providers=ort.get_available_providers())
                         result = sess.run(

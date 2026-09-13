@@ -1,17 +1,17 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-import { Env } from 'onnxruntime-common';
+import type { Env } from 'onnxruntime-common';
 
 import { calculateTensorSizeInBytes, DataType } from '../wasm-common';
 
 import type { OrtWasmModule } from '../wasm-types';
 
-import { WebGpuBackend } from './backend-webgpu';
+import type { WebGpuBackend } from './backend-webgpu';
 import { LOG_DEBUG } from './log';
-import { TensorView } from './tensor-view';
+import type { TensorView } from './tensor-view';
 import { ShapeUtil } from './util';
-import { AdapterInfo, ComputeContext, ComputeContextInputsOutputsMapping, ProgramInfo } from './webgpu/types';
+import type { AdapterInfo, ComputeContext, ComputeContextInputsOutputsMapping, ProgramInfo } from './webgpu/types';
 import { WebNNBackend } from './backend-webnn';
 
 /* eslint-disable no-bitwise */
@@ -112,18 +112,6 @@ class ComputeContextImpl implements ComputeContext {
     this.inputs = inputs;
   }
 
-  getMaxComputeWorkgroupSizes(): [number, number, number] {
-    return [
-      this.backend.device.limits.maxComputeWorkgroupSizeX,
-      this.backend.device.limits.maxComputeWorkgroupSizeY,
-      this.backend.device.limits.maxComputeWorkgroupSizeZ,
-    ];
-  }
-
-  getMaxComputeWorkgroupStoragesize(): number {
-    return this.backend.device.limits.maxComputeWorkgroupStorageSize;
-  }
-
   compute(program: ProgramInfo, inputsOutputsMapping?: ComputeContextInputsOutputsMapping): TensorView[] {
     // prepare inputs. inputs should always be valid data.
     const mappedInputs =
@@ -209,7 +197,9 @@ export const init = async (
   }
 
   if (name === 'webgpu') {
-    const backend = new WebGpuBackend();
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+    const webGpuBackendImpl = require('./backend-webgpu').WebGpuBackend;
+    const backend = new webGpuBackendImpl();
     await backend.initialize(env, gpuAdapter!);
 
     jsepInit('webgpu', [
@@ -286,19 +276,28 @@ export const init = async (
     const backend = new WebNNBackend(env);
     jsepInit('webnn', [
       backend,
-      // jsepReserveTensorId
+      // webnnReserveTensorId
       () => backend.reserveTensorId(),
-      // jsepReleaseTensorId,
+      // webnnReleaseTensorId
       (tensorId: number) => backend.releaseTensorId(tensorId),
-      // jsepEnsureTensor
-      async (tensorId: number, onnxDataType: number, shape: number[], copyOld) =>
-        backend.ensureTensor(tensorId, onnxDataType, shape, copyOld),
-      // jsepUploadTensor
+      // webnnEnsureTensor
+      async (
+        sessionId: number | undefined,
+        tensorId: number,
+        onnxDataType: number,
+        shape: number[],
+        copyOld: boolean,
+      ) => backend.ensureTensor(sessionId, tensorId, onnxDataType, shape, copyOld),
+      // webnnUploadTensor
       (tensorId: number, data: Uint8Array) => {
         backend.uploadTensor(tensorId, data);
       },
-      // jsepDownloadTensor
+      // webnnDownloadTensor
       async (tensorId: number, dstBuffer: ArrayBufferView | ArrayBuffer) => backend.downloadTensor(tensorId, dstBuffer),
+      // webnnRegisterMLContext
+      (sessionId: number, mlContext: MLContext) => backend.registerMLContext(sessionId, mlContext),
+      // webnnEnableTraceEvent
+      !!env.trace,
     ]);
   }
 };

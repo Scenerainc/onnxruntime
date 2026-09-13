@@ -4,14 +4,8 @@
 #pragma warning(disable : 4244)
 #endif
 
+#include "core/providers/cuda/cu_inc/cub.cuh"
 #include "orttraining/training_ops/cuda/tensor/gather_grad_impl.h"
-
-#include <cub/device/device_radix_sort.cuh>
-#include <cub/device/device_reduce.cuh>
-#include <cub/device/device_run_length_encode.cuh>
-#include <cub/device/device_scan.cuh>
-#include <cub/iterator/counting_input_iterator.cuh>
-#include <cub/iterator/discard_output_iterator.cuh>
 
 #include "core/providers/cuda/cu_inc/common.cuh"
 #include "core/providers/cuda/shared_inc/accumulation_type.h"
@@ -70,14 +64,14 @@ void GetSortedIndices(
       nullptr, temp_storage_size_bytes,
       dX_indices, dX_indices_sorted.get(),
       dY_indices.get(), dY_indices_sorted.get(),
-      num_gathered_indices, 0, sizeof(TIndex)*8, stream));
+      num_gathered_indices, 0, sizeof(TIndex) * 8, stream));
 
   auto temp_storage = allocator.GetScratchBuffer<void>(temp_storage_size_bytes);
   CUDA_CALL_THROW(cub::DeviceRadixSort::SortPairs(
       temp_storage.get(), temp_storage_size_bytes,
       dX_indices, dX_indices_sorted.get(),
       dY_indices.get(), dY_indices_sorted.get(),
-      num_gathered_indices, 0, sizeof(TIndex)*8, stream));
+      num_gathered_indices, 0, sizeof(TIndex) * 8, stream));
 
   dX_indices_sorted_out = std::move(dX_indices_sorted);
   dY_indices_sorted_out = std::move(dY_indices_sorted);

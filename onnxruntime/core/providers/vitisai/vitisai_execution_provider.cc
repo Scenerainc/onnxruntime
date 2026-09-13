@@ -1,6 +1,7 @@
 // Copyright (c) 2023 Advanced Micro Devices, Inc. All rights reserved.
 // Licensed under the MIT License.
 #include "vitisai_execution_provider.h"
+#include "vitisai_profiler.h"
 
 // Standard headers/libs.
 #include <cassert>
@@ -9,8 +10,9 @@
 #include <filesystem>
 
 // 1st-party headers/libs.
-#include "core/platform/env_var_utils.h"
 #include "core/common/exceptions.h"
+#include "core/platform/env_var_utils.h"
+#include "core/providers/qnn/ort_api.h"
 
 #include "vaip/capability.h"
 #include "vaip/global_api.h"
@@ -24,7 +26,10 @@ constexpr const char* VITISAI = "VITISAI";
 
 VitisAIExecutionProvider::VitisAIExecutionProvider(
     const ProviderOptions& info)
-    : IExecutionProvider{onnxruntime::kVitisAIExecutionProvider}, info_(info) {
+    : IExecutionProvider{onnxruntime::kVitisAIExecutionProvider,
+                         OrtDevice(OrtDevice::CPU, OrtDevice::MemType::DEFAULT, OrtDevice::VendorIds::NONE,
+                                   DEFAULT_CPU_ALLOCATOR_DEVICE_ID)},
+      info_(info) {  // Removed 4k alignment for now, need better fix
   auto it = info_.find("ep_context_enable");
   ep_ctx_enabled_ = it != info_.end() && it->second == "1";
   it = info_.find("ep_context_embed_mode");
@@ -50,7 +55,7 @@ const InlinedVector<const Node*> VitisAIExecutionProvider::GetEpContextNodes() c
   return ep_context_node_ptrs;
 }
 std::vector<std::unique_ptr<ComputeCapability>> VitisAIExecutionProvider::GetCapability(
-    const onnxruntime::GraphViewer& graph_viewer, const IKernelLookup& kernel_lookup) const {
+    const onnxruntime::GraphViewer& graph_viewer, const IKernelLookup& kernel_lookup, const GraphOptimizerRegistry& /* graph_optimizer_registry */, IResourceAccountant* /* resource_accountant */) const {
   if (graph_viewer.IsSubgraph()) {
     // VITIS AI EP not support sungraph. Assigned to CPU.
     return {};
@@ -76,7 +81,17 @@ common::Status VitisAIExecutionProvider::Compile(const std::vector<FusedNodeAndG
     auto& attrs = fused_node_graph.fused_node.get().GetAttributes();
     assert(attrs.count("index"));
     size_t index = attrs.at("index").i();
-    (**this->execution_providers_)[index]->set_fused_node(&fused_node_graph.fused_node.get());
+    auto& ep = (**this->execution_providers_)[index];
+    ep->set_fused_node(&fused_node_graph.fused_node.get());
+    if (ep->get_meta_def_fallback_CPU()) {
+      auto& subgraph = fused_node_graph.filtered_graph.get();
+      auto& logger = logging::LoggingManager::DefaultLogger();
+      auto model_proto = subgraph.CreateModel(logger)->ToProto();
+      subgraph.ToProto(*model_proto->mutable_graph(), true, true);
+      auto local_registries = IOnnxRuntimeOpSchemaRegistryList{subgraph.GetSchemaRegistry()};
+      auto model = Model::Create(std::move(*model_proto), subgraph.ModelPath(), &local_registries, logger);
+      ep->set_model(model.release());
+    }
     compute_info.create_state_func = [this, index](ComputeContext* context, FunctionState* state) {
       auto* p = (**this->execution_providers_)[index]->compile().release();
       *state = p;
@@ -98,7 +113,6 @@ common::Status VitisAIExecutionProvider::Compile(const std::vector<FusedNodeAndG
 }
 
 common::Status VitisAIExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_options) {
-  InlinedVector<const Node*> ep_context_node_ptrs;
   auto get_config_entry = [](const void* state, const char* entry_name) -> vaip_core::DllSafe<std::string> {
     const onnxruntime::RunOptions& run_options = *static_cast<const onnxruntime::RunOptions*>(state);
     auto ret = run_options.GetConfigOptions().GetConfigEntry(std::string(entry_name));
@@ -125,4 +139,47 @@ common::Status VitisAIExecutionProvider::SetEpDynamicOptions(gsl::span<const cha
   }
   return Status::OK();
 }
+
+std::unique_ptr<profiling::EpProfiler> VitisAIExecutionProvider::GetProfiler() {
+  return std::make_unique<profiling::VitisaiProfiler>();
+}
+
+std::string VitisAIExecutionProvider::GetCompiledModelCompatibilityInfo(
+    const onnxruntime::GraphViewer& graph_viewer) const {
+  if (!execution_providers_) {
+    return {};
+  }
+  return get_compiled_model_compatibility_info(**execution_providers_, graph_viewer);
+}
+
+common::Status VitisAIExecutionProvider::ValidateCompiledModelCompatibilityInfo(
+    const std::string& compatibility_info,
+    OrtCompiledModelCompatibility& model_compatibility) const {
+  if (!execution_providers_) {
+    model_compatibility = OrtCompiledModelCompatibility_EP_NOT_APPLICABLE;
+    return Status::OK();
+  }
+  return validate_compiled_model_compatibility_info(**execution_providers_, compatibility_info, model_compatibility);
+}
+
+std::vector<AllocatorPtr> VitisAIExecutionProvider::CreatePreferredAllocators() {
+  std::vector<AllocatorPtr> result;
+  // We do not want arena for 4k alignment, as it would not respect alignment.
+  // For CPU, use arena
+  // Removed 4k alignment for now, need better fix
+  constexpr const bool use_arena_true = true;
+  AllocatorCreationInfo device_info_cpu{
+      [](OrtDevice::DeviceId device_id) {
+        return std::make_unique<CPUAllocator>(
+            OrtMemoryInfo(
+                onnxruntime::CPU, OrtAllocatorType::OrtDeviceAllocator,
+                OrtDevice(OrtDevice::CPU, OrtDevice::MemType::DEFAULT, OrtDevice::VendorIds::NONE,
+                          device_id)));
+      },
+      DEFAULT_CPU_ALLOCATOR_DEVICE_ID, use_arena_true};
+
+  result.push_back(CreateAllocator(device_info_cpu));
+  return result;
+}
+
 }  // namespace onnxruntime

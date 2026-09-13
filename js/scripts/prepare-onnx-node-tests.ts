@@ -32,6 +32,9 @@ const JS_TEST_ROOT = path.join(JS_ROOT, 'test');
 const JS_TEST_DATA_ROOT = path.join(JS_TEST_ROOT, 'data');
 const JS_TEST_DATA_NODE_ROOT = path.join(JS_TEST_DATA_ROOT, 'node');
 
+// Configuration for download retries
+const MAX_DOWNLOAD_RETRY_TIMES = 3;
+
 const main = async () => {
   log.info('PrepareTestData', 'Preparing node tests ...');
 
@@ -43,13 +46,16 @@ const main = async () => {
     const opset = opsetMapping[0];
     const onnxVersion = opsetMapping[1];
 
+    // NOTE(onnx/onnx#7959): a NEW opset (onnx >= 1.23) CANNOT be added via this rel-* archive path — onnx/onnx#7959
+    // deletes data/node on master/future releases; it needs a different materialization mechanism
+    // (cf. tools/python/materialize_onnx_node_tests.py — JS would need its own multi-version equivalent).
     const resourceUri = `https://github.com/onnx/onnx/archive/refs/heads/rel-${onnxVersion}.zip`;
 
     log.info('PrepareTestData', `Downloading onnx ${opset}(v${onnxVersion}): ${resourceUri}`);
 
     const folderPrefix = `onnx-rel-${onnxVersion}/onnx/backend/test/data/node`;
 
-    const buffer = await downloadZip(resourceUri);
+    const buffer = await downloadZip(resourceUri, MAX_DOWNLOAD_RETRY_TIMES);
     const zip = await jszip.loadAsync(buffer);
     const entries = zip.filter((relativePath) => relativePath.startsWith(folderPrefix));
 

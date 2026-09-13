@@ -30,15 +30,22 @@ ONNX_CPU_OPERATOR_VERSIONED_KERNEL(
     KernelDefBuilder().TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
     ConvTranspose<float>);
 
-ONNX_CPU_OPERATOR_KERNEL(
+ONNX_CPU_OPERATOR_VERSIONED_KERNEL(
     ConvTranspose,
     11,
+    21,
+    KernelDefBuilder().TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
+    ConvTranspose<float>);
+
+// Opset 22 starts to support bfloat16
+ONNX_CPU_OPERATOR_KERNEL(
+    ConvTranspose,
+    22,
     KernelDefBuilder().TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
     ConvTranspose<float>);
 
 template <typename T>
 Status ConvTranspose<T>::PrePack(const Tensor& /*tensor*/, int /*input_idx*/, AllocatorPtr /*alloc*/,
-                                 bool /*save_prepacked_initializers*/,
                                  /*out*/ bool& is_packed,
                                  /*out*/ PrePackedWeights* /*prepacked_weights*/
 ) {
@@ -48,7 +55,6 @@ Status ConvTranspose<T>::PrePack(const Tensor& /*tensor*/, int /*input_idx*/, Al
 
 template <>
 Status ConvTranspose<float>::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
-                                     bool /*save_prepacked_initializers*/,
                                      /*out*/ bool& is_packed,
                                      /*out*/ PrePackedWeights* prepacked_weights) {
   is_packed = false;
@@ -70,17 +76,18 @@ Status ConvTranspose<float>::PrePack(const Tensor& tensor, int input_idx, Alloca
     size_t packed_filter_data_size = SafeInt<size_t>(packed_elements_per_group) * sizeof(float) * conv_transpose_attrs_.group;
     auto* packed_filter_data = alloc->Alloc(packed_filter_data_size);
 
+    // Wrap in BufferUniquePtr immediately to prevent leaks.
+    transposed_filter_ = BufferUniquePtr(packed_filter_data, BufferDeleter(std::move(alloc)));
+
     // Initialize memory to 0 as there could be some padding associated with pre-packed
     // buffer memory and we don not want it uninitialized and generate different hashes
     // if and when we try to cache this pre-packed buffer for sharing between sessions.
     memset(packed_filter_data, 0, packed_filter_data_size);
 
-    transposed_filter_ = BufferUniquePtr(packed_filter_data, BufferDeleter(std::move(alloc)));
-
     for (int64_t group_id = 0; group_id < conv_transpose_attrs_.group; ++group_id) {
       MlasTranspose(tensor.Data<float>() + (group_id * N * K),
-                    ((float*)packed_filter_data) + (group_id * packed_elements_per_group),
-                    K, N);
+                    static_cast<float*>(packed_filter_data) + (group_id * packed_elements_per_group),
+                    K, N, nullptr);
     }
 
     bool share_prepacked_weights = (prepacked_weights != nullptr);
@@ -96,6 +103,7 @@ Status ConvTranspose<float>::PrePack(const Tensor& tensor, int input_idx, Alloca
 
 template <typename T>
 Status ConvTranspose<T>::UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& /*prepacked_buffers*/,
+                                                   gsl::span<const size_t> /*prepacked_buffer_sizes*/,
                                                    int /*input_idx*/,
                                                    /*out*/ bool& used_shared_buffers) {
   used_shared_buffers = false;
@@ -104,6 +112,7 @@ Status ConvTranspose<T>::UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>&
 
 template <>
 Status ConvTranspose<float>::UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& prepacked_buffers,
+                                                       gsl::span<const size_t> /*prepacked_buffer_sizes*/,
                                                        int input_idx,
                                                        /*out*/ bool& used_shared_buffers) {
   used_shared_buffers = false;
@@ -270,7 +279,8 @@ Status ConvTranspose<float>::DoConvTranspose(OpKernelContext* context, bool dyna
           Xdata + group_id * X_offset,
           0,
           col_buffer_data,
-          thread_pool);
+          thread_pool,
+          &mlas_backend_kernel_selector_config_);
 
       if (p.X->Shape().NumDimensions() == 4) {
         math::Col2im<float, CPUMathUtil, StorageOrder::NCHW>(

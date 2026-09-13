@@ -23,14 +23,12 @@ class Gemm : protected GemmBase, public XnnpackKernel {
   static bool IsOnnxNodeSupported(const NodeUnit& node_unit, const GraphViewer& graph);
 
   Status PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
-                 bool save_prepacked_initializers,
                  /*out*/ bool& is_packed,
                  /*out*/ PrePackedWeights* prepacked_weights) override;
 
  private:
   const Tensor* B_{nullptr};
 
-  int64_t M_ = -1;
   int64_t K_ = -1;
   int64_t N_ = -1;
 

@@ -6,9 +6,8 @@
 #include <limits>
 #include <optional>
 #include <utility>
-#include "core/graph/graph_utils.h"
-#include "core/framework/node_unit.h"
-#include "core/providers/shared/utils/utils.h"
+
+#include "core/providers/qnn/ort_api.h"
 #include "core/providers/qnn/builder/qnn_utils.h"
 #include "core/providers/qnn/builder/op_builder_factory.h"
 #include "core/providers/qnn/builder/qnn_node_group/utils.h"
@@ -90,7 +89,7 @@ static Status CreateOrValidateOnQnn(QnnModelWrapper& qnn_model_wrapper,
                                     const NodeUnit& q_node_unit,
                                     bool validate) {
   assert(dq_node_unit.OpType() == DEQUANTIZE_LINEAR && q_node_unit.OpType() == QUANTIZE_LINEAR);
-  const auto& node_name = utils::GetNodeName(dq_node_unit);
+  const auto& node_name = utils::GetUniqueName(dq_node_unit);
   const NodeUnitIODef& input_def = dq_node_unit.Inputs()[0];
   const NodeUnitIODef& output_def = q_node_unit.Outputs()[0];
 
@@ -110,7 +109,7 @@ static Status CreateOrValidateOnQnn(QnnModelWrapper& qnn_model_wrapper,
   } else {
     ORT_RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(input_tensor)), "Failed to add input");
     ORT_RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(output_tensor)), "Failed to add output");
-    ORT_RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(utils::GetNodeName(q_node_unit),
+    ORT_RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(node_name,
                                                       QNN_OP_PACKAGE_NAME_QTI_AISW,
                                                       QNN_OP_CONVERT,
                                                       {input_def.node_arg.Name()},

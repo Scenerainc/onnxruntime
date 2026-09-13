@@ -15,26 +15,6 @@ file(GLOB_RECURSE onnxruntime_cpu_contrib_ops_srcs CONFIGURE_DEPENDS
   "${ONNXRUNTIME_ROOT}/contrib_ops/cpu/*.cc"
 )
 
-file(GLOB_RECURSE onnxruntime_cuda_contrib_ops_cc_srcs CONFIGURE_DEPENDS
-  "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/*.h"
-  "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/*.cc"
-)
-
-file(GLOB_RECURSE onnxruntime_cuda_contrib_ops_cu_srcs CONFIGURE_DEPENDS
-  "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/*.cu"
-  "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/*.cuh"
-)
-
-file(GLOB_RECURSE onnxruntime_rocm_contrib_ops_cc_srcs CONFIGURE_DEPENDS
-  "${ONNXRUNTIME_ROOT}/contrib_ops/rocm/*.h"
-  "${ONNXRUNTIME_ROOT}/contrib_ops/rocm/*.cc"
-)
-
-file(GLOB_RECURSE onnxruntime_rocm_contrib_ops_cu_srcs CONFIGURE_DEPENDS
-  "${ONNXRUNTIME_ROOT}/contrib_ops/rocm/*.cu"
-  "${ONNXRUNTIME_ROOT}/contrib_ops/rocm/*.cuh"
-)
-
 file(GLOB_RECURSE onnxruntime_js_contrib_ops_cc_srcs CONFIGURE_DEPENDS
   "${ONNXRUNTIME_ROOT}/contrib_ops/js/*.h"
   "${ONNXRUNTIME_ROOT}/contrib_ops/js/*.cc"
@@ -103,7 +83,7 @@ if (onnxruntime_ENABLE_TRAINING_OPS AND NOT onnxruntime_ENABLE_TRAINING)
   list(REMOVE_ITEM onnxruntime_providers_src ${onnxruntime_cpu_full_training_only_srcs})
 endif()
 
-if (onnxruntime_ENABLE_ATEN)
+if (onnxruntime_ENABLE_DLPACK)
   file(GLOB_RECURSE onnxruntime_providers_dlpack_srcs CONFIGURE_DEPENDS
     "${ONNXRUNTIME_ROOT}/core/dlpack/dlpack_converter.cc"
     "${ONNXRUNTIME_ROOT}/core/dlpack/dlpack_converter.h"
@@ -140,25 +120,43 @@ endif()
 if (onnxruntime_REDUCED_OPS_BUILD)
   substitute_op_reduction_srcs(onnxruntime_providers_src)
 endif()
-onnxruntime_add_static_library(onnxruntime_providers ${onnxruntime_providers_src})
+# Only one of these targets exists per configuration, and consumers link
+# ${onnxruntime_providers_target} rather than either name, so the choice lives here alone.
+#
+# With onnxruntime_ENABLE_LTO on MSVC the objects carry whole-program IR, which pushes the archive
+# past the 4 GiB limit lib.exe enforces on the COFF archive format (LNK1248). No lib.exe option
+# raises the limit, and a shared-library build only needs the objects for the final link, so no
+# archive is produced there.
+#
+# The archive cannot instead be materialized from $<TARGET_OBJECTS:...> of an always-present object
+# library: the Xcode generator hash-suffixes object filenames when source basenames collide, as
+# some of these sources do, while TARGET_OBJECTS expands to the unsuffixed names, so libtool fails
+# to find them.
+if (MSVC AND onnxruntime_BUILD_SHARED_LIB)
+  onnxruntime_add_object_library(onnxruntime_providers_obj ${onnxruntime_providers_src})
+  set(onnxruntime_providers_target onnxruntime_providers_obj)
+else()
+  onnxruntime_add_static_library(onnxruntime_providers ${onnxruntime_providers_src})
+  set(onnxruntime_providers_target onnxruntime_providers)
+endif()
 if (onnxruntime_REDUCED_OPS_BUILD)
-  add_op_reduction_include_dirs(onnxruntime_providers)
+  add_op_reduction_include_dirs(${onnxruntime_providers_target})
 endif()
 
 if (HAS_BITWISE_INSTEAD_OF_LOGICAL)
-  target_compile_options(onnxruntime_providers PRIVATE "-Wno-bitwise-instead-of-logical")
+  target_compile_options(${onnxruntime_providers_target} PRIVATE "-Wno-bitwise-instead-of-logical")
 endif()
 
 if (MSVC)
-   target_compile_options(onnxruntime_providers PRIVATE "/bigobj")
+   target_compile_options(${onnxruntime_providers_target} PRIVATE "/bigobj")
 #   if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-#      target_compile_options(onnxruntime_providers PRIVATE "/wd4244")
+#      target_compile_options(${onnxruntime_providers_target} PRIVATE "/wd4244")
 #   endif()
 endif()
-onnxruntime_add_include_to_target(onnxruntime_providers onnxruntime_common onnxruntime_framework onnx onnx_proto ${PROTOBUF_LIB} flatbuffers::flatbuffers Boost::mp11 safeint_interface)
+onnxruntime_add_include_to_target(${onnxruntime_providers_target} onnxruntime_common onnxruntime_framework onnx onnx_proto ${PROTOBUF_LIB} flatbuffers::flatbuffers Boost::mp11 safeint_interface)
 
 if (onnxruntime_BUILD_MS_EXPERIMENTAL_OPS)
-  target_compile_definitions(onnxruntime_providers PRIVATE BUILD_MS_EXPERIMENTAL_OPS=1)
+  target_compile_definitions(${onnxruntime_providers_target} PRIVATE BUILD_MS_EXPERIMENTAL_OPS=1)
 endif()
 
 if(HAS_DEPRECATED_COPY)
@@ -181,40 +179,43 @@ if (onnxruntime_ENABLE_CPU_FP16_OPS)
   set_source_files_properties(${ORTTRAINING_SOURCE_DIR}/training_ops/cuda/collective/adasum_kernels.cc PROPERTIES COMPILE_FLAGS " -fassociative-math -ffast-math -ftree-vectorize -funsafe-math-optimizations -mf16c -mavx -mfma ")
 endif()
 
-target_include_directories(onnxruntime_providers PRIVATE ${ONNXRUNTIME_ROOT} ${eigen_INCLUDE_DIRS})
-onnxruntime_add_include_to_target(onnxruntime_providers re2::re2)
-add_dependencies(onnxruntime_providers onnx ${onnxruntime_EXTERNAL_DEPENDENCIES})
+target_include_directories(${onnxruntime_providers_target} PRIVATE ${ONNXRUNTIME_ROOT})
+onnxruntime_add_include_to_target(${onnxruntime_providers_target} re2::re2 Eigen3::Eigen)
+add_dependencies(${onnxruntime_providers_target} onnx ${onnxruntime_EXTERNAL_DEPENDENCIES})
 
 if (onnxruntime_ENABLE_TRAINING_OPS)
-  target_include_directories(onnxruntime_providers PRIVATE ${ORTTRAINING_ROOT})
+  target_include_directories(${onnxruntime_providers_target} PRIVATE ${ORTTRAINING_ROOT})
 endif()
 
 if (onnxruntime_ENABLE_ATEN)
-  target_compile_definitions(onnxruntime_providers PRIVATE ENABLE_ATEN)
+  target_compile_definitions(${onnxruntime_providers_target} PRIVATE ENABLE_ATEN)
+endif()
+
+if (onnxruntime_ENABLE_DLPACK)
+  target_compile_definitions(${onnxruntime_providers_target} PRIVATE ENABLE_DLPACK)
   # DLPack is a header-only dependency
-  set(DLPACK_INCLUDE_DIR ${dlpack_SOURCE_DIR}/include)
-  target_include_directories(onnxruntime_providers PRIVATE ${DLPACK_INCLUDE_DIR})
+  onnxruntime_add_include_to_target(${onnxruntime_providers_target} dlpack::dlpack)
 endif()
 
 if (onnxruntime_ENABLE_TRAINING)
-  add_dependencies(onnxruntime_providers tensorboard)
-  onnxruntime_add_include_to_target(onnxruntime_providers tensorboard)
+  add_dependencies(${onnxruntime_providers_target} tensorboard)
+  onnxruntime_add_include_to_target(${onnxruntime_providers_target} tensorboard)
   if (onnxruntime_ENABLE_TRAINING_TORCH_INTEROP OR onnxruntime_ENABLE_TRITON)
-    onnxruntime_add_include_to_target(onnxruntime_providers Python::Module)
+    onnxruntime_add_include_to_target(${onnxruntime_providers_target} Python::Module)
   endif()
 
-  if (onnxruntime_USE_NCCL OR onnxruntime_USE_MPI)
-    target_include_directories(onnxruntime_providers PUBLIC ${MPI_CXX_INCLUDE_DIRS})
+  if (onnxruntime_USE_NCCL)
+    target_include_directories(${onnxruntime_providers_target} PUBLIC ${MPI_CXX_INCLUDE_DIRS})
   endif()
 endif()
 
 install(FILES ${PROJECT_SOURCE_DIR}/../include/onnxruntime/core/providers/cpu/cpu_provider_factory.h  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/onnxruntime/)
 install(FILES ${PROJECT_SOURCE_DIR}/../include/onnxruntime/core/providers/resource.h ${PROJECT_SOURCE_DIR}/../include/onnxruntime/core/providers/custom_op_context.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/onnxruntime/core/providers)
-set_target_properties(onnxruntime_providers PROPERTIES LINKER_LANGUAGE CXX)
-set_target_properties(onnxruntime_providers PROPERTIES FOLDER "ONNXRuntime")
+set_target_properties(${onnxruntime_providers_target} PROPERTIES LINKER_LANGUAGE CXX)
+set_target_properties(${onnxruntime_providers_target} PROPERTIES FOLDER "ONNXRuntime")
 
 if (NOT onnxruntime_MINIMAL_BUILD AND NOT onnxruntime_EXTENDED_MINIMAL_BUILD
-                                  AND NOT ${CMAKE_SYSTEM_NAME} MATCHES "Darwin|iOS|visionOS"
+                                  AND NOT ${CMAKE_SYSTEM_NAME} MATCHES "Darwin|iOS|visionOS|tvOS"
                                   AND NOT CMAKE_SYSTEM_NAME STREQUAL "Android"
                                   AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   file(GLOB onnxruntime_providers_shared_cc_srcs CONFIGURE_DEPENDS
@@ -226,6 +227,12 @@ if (NOT onnxruntime_MINIMAL_BUILD AND NOT onnxruntime_EXTENDED_MINIMAL_BUILD
   onnxruntime_add_shared_library(onnxruntime_providers_shared ${onnxruntime_providers_shared_cc_srcs} "${ONNXRUNTIME_ROOT}/core/dll/onnxruntime.rc")
   set_target_properties(onnxruntime_providers_shared PROPERTIES FOLDER "ONNXRuntime")
   set_target_properties(onnxruntime_providers_shared PROPERTIES LINKER_LANGUAGE CXX)
+  #ON AIX, to call dlopen on onnxruntime_providers_shared, we need to generate this library as shared object .so file.
+  #Latest cmake behavior is changed and  cmake will remove shared object .so file after generating the shared archive.
+  #To prevent that, making AIX_SHARED_LIBRARY_ARCHIVE as OFF for onnxruntime_providers_shared.
+  if (CMAKE_SYSTEM_NAME MATCHES "AIX")
+    set_target_properties(onnxruntime_providers_shared PROPERTIES AIX_SHARED_LIBRARY_ARCHIVE OFF)
+  endif()
 
   target_compile_definitions(onnxruntime_providers_shared PRIVATE FILE_NAME=\"onnxruntime_providers_shared.dll\")
 
@@ -238,8 +245,10 @@ if (NOT onnxruntime_MINIMAL_BUILD AND NOT onnxruntime_EXTENDED_MINIMAL_BUILD
   if(APPLE)
   set_property(TARGET onnxruntime_providers_shared APPEND_STRING PROPERTY LINK_FLAGS "-Xlinker -exported_symbols_list ${ONNXRUNTIME_ROOT}/core/providers/shared/exported_symbols.lst")
   elseif(UNIX)
-    if(NOT ${CMAKE_SYSTEM_NAME} MATCHES "AIX")
-      set_property(TARGET onnxruntime_providers_shared APPEND_STRING PROPERTY LINK_FLAGS "-Xlinker --version-script=${ONNXRUNTIME_ROOT}/core/providers/shared/version_script.lds -Xlinker --gc-sections")
+    if(NOT CMAKE_SYSTEM_NAME MATCHES "AIX")
+      target_link_options(onnxruntime_providers_shared PRIVATE
+                          "LINKER:--version-script=${ONNXRUNTIME_ROOT}/core/providers/shared/version_script.lds"
+                          "LINKER:--gc-sections")
     endif()
   elseif(WIN32)
   set_property(TARGET onnxruntime_providers_shared APPEND_STRING PROPERTY LINK_FLAGS "-DEF:${ONNXRUNTIME_ROOT}/core/providers/shared/symbols.def")
@@ -256,7 +265,7 @@ if (NOT onnxruntime_MINIMAL_BUILD AND NOT onnxruntime_EXTENDED_MINIMAL_BUILD
 endif()
 
 if (NOT onnxruntime_BUILD_SHARED_LIB)
-  install(TARGETS onnxruntime_providers
+  install(TARGETS onnxruntime_providers EXPORT ${PROJECT_NAME}Targets
           ARCHIVE   DESTINATION ${CMAKE_INSTALL_LIBDIR}
           LIBRARY   DESTINATION ${CMAKE_INSTALL_LIBDIR}
           RUNTIME   DESTINATION ${CMAKE_INSTALL_BINDIR}

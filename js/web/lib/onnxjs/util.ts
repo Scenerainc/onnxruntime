@@ -1,11 +1,10 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-import { flatbuffers } from 'flatbuffers';
 import Long from 'long';
 
 import { Graph } from './graph';
-import { onnxruntime } from './ort-schema/flatbuffers/ort-generated';
+import * as ortFbs from './ort-schema/flatbuffers/ort-generated';
 import { onnx } from './ort-schema/protobuf/onnx';
 import { Tensor } from './tensor';
 
@@ -101,7 +100,7 @@ export class MatMulUtil {
 
   /**
    * Fix the output shape computed for MatMul operation if it needs fixing
-   * @param outputShape The computed outputShape. Should be an array (atleast of length 2) of positive integers.
+   * @param outputShape The computed outputShape. Should be an array (at least of length 2) of positive integers.
    * This will be mutated.
    * @param aRank The rank of tensor A.
    * @param bRank The rank of tensor B.
@@ -184,7 +183,7 @@ export class BroadcastUtil {
   /**
    * Given the indices of a broadcasted tensor, calculate the original indices
    * @param broadcastedIndices The given indices of the broadcasted tensor.
-   * @param originalShape The original shape of the tensor before broadcas
+   * @param originalShape The original shape of the tensor before broadcast
    * @returns The calculated indices that maps to the original tensor.
    */
   static index(broadcastedIndices: readonly number[], originalShape: readonly number[]): number[] {
@@ -244,7 +243,7 @@ export class BroadcastUtil {
         c.set([], op(a.get([]) as number, b.get([]) as number));
       }
 
-      // atleast one input is a non-scalar
+      // at least one input is a non-scalar
       else {
         const outputIndices = new Array<number>(outputShape.length);
         const originalIndicesA = new Array(a.dims.length);
@@ -413,9 +412,7 @@ export class GemmUtil {
 }
 
 export class ProtoUtil {
-  static tensorDataTypeFromProto(
-    typeProto: onnx.TensorProto.DataType | onnxruntime.experimental.fbs.TensorDataType,
-  ): Tensor.DataType {
+  static tensorDataTypeFromProto(typeProto: onnx.TensorProto.DataType | ortFbs.TensorDataType): Tensor.DataType {
     switch (typeProto) {
       case onnx.TensorProto.DataType.INT8:
         return 'int8';
@@ -494,7 +491,7 @@ export class ProtoUtil {
     };
   }
 
-  static tensorDimsFromORTFormat(tensor: onnxruntime.experimental.fbs.Tensor) {
+  static tensorDimsFromORTFormat(tensor: ortFbs.Tensor) {
     const dims = [];
     for (let i = 0; i < tensor.dimsLength(); i++) {
       dims.push(LongUtil.longToNumber(tensor.dims(i)!));
@@ -502,7 +499,7 @@ export class ProtoUtil {
     return dims;
   }
 
-  static tensorAttributesFromORTFormat(node: onnxruntime.experimental.fbs.Node) {
+  static tensorAttributesFromORTFormat(node: ortFbs.Node) {
     const attributes = [];
     for (let i = 0; i < node.attributesLength(); i++) {
       attributes.push(node.attributes(i)!);
@@ -515,16 +512,16 @@ export class LongUtil {
   // This function is called to get a number from long type of data for attribute, dim, and ir version,
   // which values are signed integers.
   // To make it more generic, add an optional parameter to convert to a unsigned number.
-  static longToNumber(n: Long | flatbuffers.Long | number, unsigned?: boolean) {
+  static longToNumber(n: Long | bigint | number) {
     if (Long.isLong(n)) {
       return n.toNumber();
-    } else if (n instanceof flatbuffers.Long) {
-      return Long.fromValue({ low: n.low, high: n.high, unsigned: unsigned ?? false }).toNumber();
+    } else if (typeof n === 'bigint') {
+      return Number(n);
     }
     return n;
   }
   static isLong(n: unknown) {
-    return Long.isLong(n) || n instanceof flatbuffers.Long;
+    return Long.isLong(n) || typeof n === 'bigint';
   }
 }
 
@@ -556,7 +553,6 @@ export class ShapeUtil {
       // size cannot be 0 or negative.
       if (dims[i] <= 0) {
         throw new Error(
-          // eslint-disable-next-line max-len
           'cannot get valid size from specified dimension range. Most likely the range contains 0 or negative values in them.',
         );
       }
@@ -614,7 +610,7 @@ export class ShapeUtil {
   }
 
   /**
-   * normailze axis of range [-r, r) into [0, r).
+   * normalize axis of range [-r, r) into [0, r).
    */
   static normalizeAxis(axis: number, tensorRank: number): number {
     if (axis < -tensorRank && axis >= tensorRank) {
@@ -1264,6 +1260,8 @@ export class PoolConvUtil {
    * @param pads Padding for the beginning and ending along each axis.
    * @param autoPad DEPRECATED attribute supported for legacy models. Specifies how to implicitly calculate pads in each
    *     dimension. Can take values NOTSET, SAME_UPPER, SAME_LOWER, or VALID.
+   * @param ceilMode When set to 1, use ceil() instead of floor() to compute the output spatial size (and apply the
+   *     "shrink the last window if it starts entirely in padding" rule). Defaults to 0 (floor).
    */
   static computePoolOutputShape(
     isGlobalOperator: boolean,
@@ -1273,6 +1271,7 @@ export class PoolConvUtil {
     kernelShape: number[],
     pads: number[],
     autoPad?: string,
+    ceilMode = 0,
   ): number[] {
     if (inputDims.length <= 0) {
       throw new Error('input shape must be of size greater than 0');
@@ -1290,6 +1289,7 @@ export class PoolConvUtil {
       kernelShape,
       pads,
       autoPad,
+      ceilMode,
     );
     return outputDims;
   }
@@ -1336,6 +1336,7 @@ export class PoolConvUtil {
     kernelShape: readonly number[],
     pads: number[],
     autoPad?: string,
+    ceilMode = 0,
   ) {
     if (isGlobalOperator) {
       for (let dim = 0; dim < inputDims.length - 2; dim++) {
@@ -1353,10 +1354,42 @@ export class PoolConvUtil {
             dim,
             dim + inputDims.length - 2,
             autoPad,
+            ceilMode,
           ),
         );
       }
     }
+  }
+
+  // Computes the output spatial size for a single dimension.
+  // Produces results identical to the C++ PoolAttributes::ComputeOutputSize
+  // (onnxruntime/core/providers/cpu/nn/pool_attributes.h), including the ceil_mode
+  // "shrink the last window if it starts entirely in the trailing padding" rule. The JS
+  // signature takes a pre-computed `numerator` (equal to `inSize + padHead + padTail - dkernel`,
+  // matching the C++ `in_size + pad_head + pad_tail - dilation * (kernel - 1) - 1`) instead of
+  // the raw pooling attributes, but the computed output size is the same.
+  // Keep in sync with the onnxjs/jsep copy.
+  // NOTE: In this onnxjs copy the ceilMode path exists for shape-test parity with the jsep copy;
+  // the onnxjs WebGL pooling caller (backends/webgl/ops/pool.ts) intentionally does NOT pass
+  // ceilMode (legacy path still throws on ceil_mode != 0), so it always uses the floor default.
+  private static computeOutputSize(
+    numerator: number,
+    stride: number,
+    inSize: number,
+    padHead: number,
+    ceilMode: number,
+  ): number {
+    let outSize = Math.floor(numerator / stride) + 1;
+    // Match C++ `ceil_mode == 1` exactly so out-of-spec ceil_mode values do not diverge.
+    if (ceilMode === 1) {
+      outSize = Math.ceil(numerator / stride) + 1;
+      // Ensure the last pooling window starts inside the image (ref: https://github.com/onnx/onnx/pull/5741).
+      // inSize and padHead are needed here to reconstruct the last window's start position.
+      if ((outSize - 1) * stride >= inSize + padHead) {
+        outSize -= 1;
+      }
+    }
+    return outSize;
   }
 
   // helper for computeShapeHelper() and adjustPadsBasedOnAutoPad()
@@ -1370,6 +1403,7 @@ export class PoolConvUtil {
     padHeadIndex: number,
     padTailIndex: number,
     autoPad?: string,
+    ceilMode = 0,
   ): number {
     const dkernel = dilation * (kernel - 1) + 1;
     if (autoPad && autoPad !== 'NOTSET') {
@@ -1377,23 +1411,36 @@ export class PoolConvUtil {
         case 'VALID':
           pads[padHeadIndex] = 0;
           pads[padTailIndex] = 0;
-          return Math.floor((inSize - dkernel) / stride + 1);
+          return PoolConvUtil.computeOutputSize(inSize - dkernel, stride, inSize, 0, ceilMode);
         case 'SAME_LOWER':
         case 'SAME_UPPER':
           if (dilation !== 1) {
             throw new Error('Dilation not supported for SAME_UPPER or SAME_LOWER');
           } else {
-            const legacyTargetSize = (inSize + stride - 1) / stride;
+            // Integer division to match C++ pool_attributes.h ComputeSizePadDilations; float division mis-rounds SAME_* pads.
+            const legacyTargetSize = Math.floor((inSize + stride - 1) / stride);
             const padNeeded = (legacyTargetSize - 1) * stride + kernel - inSize;
             pads[padHeadIndex] = autoPad === 'SAME_LOWER' ? Math.floor((padNeeded + 1) / 2) : Math.floor(padNeeded / 2);
             pads[padTailIndex] = padNeeded - pads[padHeadIndex];
-            return Math.floor((inSize + padNeeded - kernel) / stride + 1);
+            return PoolConvUtil.computeOutputSize(
+              inSize + pads[padHeadIndex] + pads[padTailIndex] - dkernel,
+              stride,
+              inSize,
+              pads[padHeadIndex],
+              ceilMode,
+            );
           }
         default:
           throw new Error('Unsupported AutoPad type');
       }
     } else {
-      return Math.floor((inSize + pads[padHeadIndex] + pads[padTailIndex] - dkernel) / stride + 1);
+      return PoolConvUtil.computeOutputSize(
+        inSize + pads[padHeadIndex] + pads[padTailIndex] - dkernel,
+        stride,
+        inSize,
+        pads[padHeadIndex],
+        ceilMode,
+      );
     }
   }
 }

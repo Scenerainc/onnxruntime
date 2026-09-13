@@ -7,13 +7,25 @@
 #include "core/graph/graph.h"
 #include "core/framework/fuse_nodes_funcs.h"
 #include "core/framework/transform_layout_functions.h"
+#include "core/optimizer/graph_optimizer_registry.h"
 
 namespace onnxruntime {
 
 class ExecutionProviders;
 class KernelRegistryManager;
+class LayeringIndex;
 class Model;
 struct ConfigOptions;
+
+namespace epctx {
+struct ModelGenOptions;
+}
+
+// OnPartitionAssignmentFunction is called by GraphPartitioner when a subgraph is assigned to
+// an execution provider. Can be used to collect partitioning information.
+using OnPartitionAssignmentFunction = std::function<void(const Graph& graph,
+                                                         const ComputeCapability& assigned_subgraph,
+                                                         const std::string& assigned_ep_type)>;
 
 class GraphPartitioner {
  public:
@@ -24,18 +36,51 @@ class GraphPartitioner {
   };
 
   // The order of providers represents the user preference.
-  GraphPartitioner(KernelRegistryManager& kernel_registry_mgr, const ExecutionProviders& providers)
+  GraphPartitioner(KernelRegistryManager& kernel_registry_mgr,
+                   const ExecutionProviders& providers,
+                   std::unique_ptr<GraphOptimizerRegistry> graph_optimizer_registry)
       : kernel_registry_mgr_(kernel_registry_mgr),
-        providers_(providers) {
+        providers_(providers),
+        graph_optimizer_registry_(std::move(graph_optimizer_registry)) {
+  }
+
+  GraphPartitioner(KernelRegistryManager& kernel_registry_mgr,
+                   const ExecutionProviders& providers,
+                   std::unique_ptr<GraphOptimizerRegistry> graph_optimizer_registry,
+                   CheckLoadCancellationFn check_load_cancellation_fn,
+                   OnPartitionAssignmentFunction on_partition_assignment_fn = {})
+      : kernel_registry_mgr_(kernel_registry_mgr),
+        providers_(providers),
+        graph_optimizer_registry_(std::move(graph_optimizer_registry)),
+        check_load_cancellation_fn_(std::move(check_load_cancellation_fn)),
+        on_partition_assignment_fn_(std::move(on_partition_assignment_fn)) {
   }
 
   // Run partitioning.
+  //
+  // Output-model serialization (only when ep_context_gen_options is enabled, e.g. via the Compile API): if
+  // a compiling EP produced EPContext nodes, that model is serialized here at the end of partition.
+  // Otherwise, for a compile-only session (the Compile API with no compiled nodes), the plain optimized
+  // graph is emitted by InferenceSession (not here) at a point chosen by the optimization level - before
+  // the Level2+ loop for < Level2, or after all transforms for >= Level2 (to capture the L2-L4 fusions).
+  // Callers distinguish via AnyEpContextNodesProduced().
   Status Partition(Graph& graph, FuncManager& func_mgr,
                    const layout_transformation::TransformLayoutFunction& transform_layout_function,
                    const ConfigOptions& config_options,
                    const logging::Logger& logger,
+                   LayeringIndex* layering_index,
                    Mode mode = Mode::kNormal,
+                   const epctx::ModelGenOptions& ep_context_gen_options = {},
                    const layout_transformation::DebugGraphFn& debug_graph_fn = {}) const;
+
+#ifndef ORT_MINIMAL_BUILD
+  // Returns true if any execution provider produced EPContext (compiled) nodes during partitioning.
+  bool AnyEpContextNodesProduced() const;
+#endif
+
+  bool IsLoadCancellationFlagSet() const {
+    return check_load_cancellation_fn_ && check_load_cancellation_fn_();
+  }
 
 #ifndef ORT_MINIMAL_BUILD
   /// <summary>
@@ -64,6 +109,9 @@ class GraphPartitioner {
 
   KernelRegistryManager& kernel_registry_mgr_;
   const ExecutionProviders& providers_;
+  std::unique_ptr<GraphOptimizerRegistry> graph_optimizer_registry_;
+  CheckLoadCancellationFn check_load_cancellation_fn_;
+  OnPartitionAssignmentFunction on_partition_assignment_fn_;
 };
 
 }  // namespace onnxruntime

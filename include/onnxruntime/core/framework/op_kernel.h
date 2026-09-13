@@ -4,10 +4,14 @@
 #pragma once
 
 #include "boost/mp11.hpp"
+#include <gsl/gsl>
 
 // It is safe to include the below header even if SHARED_PROVIDER macro is enabled
 // as it doesn't include any pb headers.
+#include "core/framework/buffer_deleter.h"
 #include "core/framework/prepacked_weights_container.h"
+#include "core/framework/workspace_input_shape.h"
+#include "core/framework/workspace_requirement.h"
 
 #ifndef SHARED_PROVIDER
 #include <functional>
@@ -25,7 +29,6 @@
 #include "core/graph/constants.h"
 #include "core/graph/graph_viewer.h"
 #include "core/graph/onnx_protobuf.h"
-#include <gsl/gsl>
 namespace onnxruntime {
 class OpKernelContext;
 }
@@ -79,7 +82,6 @@ class OpKernel {
   //               the allocator tied to the session if the kernel owns the pre-packed buffer or an
   //               allocator shared between sessions if the pre-packed buffer is to be shared across sessions
   //               (i.e.) the kernel does not own the buffer.
-  // @param save_prepacked_initializers: Set it to true if intend to save prepacked initializers to external data file.
   // @param is_packed: Set it to true if the kernel packed the tensor or to false
   //                   The kernel is responsible for keeping the packed data and related metadata if is_packed is true,
   //                   and the original initialized constant tensor will be released and not accessible anymore in
@@ -89,7 +91,6 @@ class OpKernel {
 
   virtual Status
   PrePack(const Tensor& /*tensor*/, int /*input_idx*/, AllocatorPtr /*alloc*/,
-          bool, /*save_prepacked_initializers*/
           /*out*/ bool& is_packed, /*out*/ PrePackedWeights* /*prepacked_weights*/) {
     is_packed = false;
     return Status::OK();
@@ -106,8 +107,28 @@ class OpKernel {
     return Status::OK();
   }
 
+  // Phase-A memory roadmap (issue microsoft/onnxruntime#29775). Declares Compute()-time scratch
+  // ("workspace") that can be sized from shape metadata alone, without live tensors. The positional
+  // span corresponds to Node::InputDefs() and OpKernelContext::Input(i); implicit inputs are
+  // excluded. The default declares nothing, so callers fall back to today's dynamic GetScratchBuffer
+  // path and behavior is unchanged for kernels that do not override this method.
+  //
+  // Called during FinalizeSessionState() after kernel instances are created, when input shapes
+  // are known (static models) or max shape hints are provided via session.max_shape_override.
+  // Max-shape inference produces estimation hints, not proven upper bounds; declarations based on
+  // them must retain runtime validation and allocation fallback.
+  // A valid input that cannot be estimated returns OK with no requirements. A non-OK status is
+  // fatal to session initialization.
+  [[nodiscard]] virtual Status DeclareWorkspaceRequirements(
+      gsl::span<const WorkspaceInputShape> /*input_shapes*/,
+      /*out*/ InlinedVector<WorkspaceRequirement>& requirements) const {
+    requirements.clear();  // defensive: never attribute a prior kernel's slots to a no-op kernel
+    return Status::OK();
+  }
+
   // Override this function to use provided pre-packed weight.
   // Status UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& prepacked_buffers,
+  //                                 gsl::span<const size_t> prepacked_buffer_sizes,
   //                                 int input_idx,
   //                                 /*out*/ bool& used_shared_buffers) {
   //     used_shared_buffers = true;
@@ -121,33 +142,15 @@ class OpKernel {
   //                            and must use the same order for retrieval in UseSharedPrePackedBuffers(). Though each element
   //                           of this vector is a BufferUniquePtr, the deleter of the BufferUniquePtr is NULL. So actually they
   //                           are raw pointers.
+  // @param prepacked_buffer_sizes: The sizes (in bytes) of each buffer in prepacked_buffers.
   // @param input_idx: The input index of the tensor in this kernel
   // @param used_shared_buffers: Boolean flag set by the kernel implementation indicating
   // that the provided weight has been used by the kernel.
   virtual Status UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& /*prepacked_buffers*/,
+                                           gsl::span<const size_t> /*prepacked_buffer_sizes*/,
                                            int /*input_idx*/,
                                            /*out*/ bool& used_shared_buffers) {
     used_shared_buffers = false;
-    return Status::OK();
-  }
-
-  // Override this function to get pre-packed tensors from this kernel.
-  // Only useful for models run on PC with CPU so ORT could load prepacked weights directly from
-  // ONNX data file with mmap and no need to do prepacking on fly to save a lot of heap memory.
-  // @param input_idx : The index of input we prepacked before and intend to get packed tensor back.
-  // Please refer to matmul_nbits kernel for a complete example.
-  virtual std::optional<Tensor> GetPrePackTensor(int /*input_idx*/) {
-    return std::nullopt;
-  }
-
-  // Override this function to set pre-packed tensors to this kernel and restore prepacked weight buffer.
-  // Only useful for models run on PC with CPU so ORT could load prepacked weights directly from
-  // ONNX data file with mmap and no need to do prepacking on fly to save a lot of heap memory.
-  // Please refer to matmul_nbits kernel for a complete example.
-  // @param input_idx : The input index of the tensor in this kernel.
-  // @param pre_packed_tensor: The prepacked tensor read from onnx data file and use the prepacked tensor
-  // to restore prepacked weight buffer.
-  virtual Status SetPrePackTensor(int /*input_idx*/, const Tensor& /*pre_packed_tensor*/) {
     return Status::OK();
   }
 
@@ -209,13 +212,6 @@ namespace js {
 template <typename T>
 KernelCreateInfo BuildKernelCreateInfo();
 }  // namespace js
-}  // namespace contrib
-
-namespace contrib {
-namespace rocm {
-template <typename T>
-KernelCreateInfo BuildKernelCreateInfo();
-}  // namespace rocm
 }  // namespace contrib
 
 namespace contrib {
@@ -324,6 +320,24 @@ using BuildKernelCreateInfoFn = KernelCreateInfo (*)();
             .Provider(provider)                                                                                                    \
             .Build(),                                                                                                              \
         static_cast<KernelCreatePtrFn>([](FuncManager&, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status { out = std::make_unique<__VA_ARGS__>(info); return Status::OK(); })); \
+  }
+
+#define ONNX_OPERATOR_THREE_TYPED_KERNEL_CLASS_NAME(provider, domain, ver, type1, type2, type3, name) \
+  provider##_##name##_##domain##_ver##ver##_##type1##_##type2##_##type3
+
+#define ONNX_OPERATOR_THREE_TYPED_KERNEL_EX(name, domain, ver, type1, type2, type3, provider, builder, ...)                        \
+  class ONNX_OPERATOR_THREE_TYPED_KERNEL_CLASS_NAME(provider, domain, ver, type1, type2, type3, name);                             \
+  template <>                                                                                                                      \
+  KernelCreateInfo                                                                                                                 \
+  BuildKernelCreateInfo<ONNX_OPERATOR_THREE_TYPED_KERNEL_CLASS_NAME(provider, domain, ver, type1, type2, type3, name)>() {         \
+    return KernelCreateInfo(                                                                                                       \
+        builder.SetName(#name)                                                                                                     \
+            .SetDomain(domain)                                                                                                     \
+            .SinceVersion(ver)                                                                                                     \
+            .Provider(provider)                                                                                                    \
+            .Build(),                                                                                                              \
+        static_cast<KernelCreatePtrFn>([](FuncManager&, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status {  \
+          out = std::make_unique<__VA_ARGS__>(info); return Status::OK(); })); \
   }
 
 #define ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_CLASS_NAME(provider, domain, startver, endver, type, name) \

@@ -22,15 +22,31 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
   CreateActivationOpBuilder("PRelu", op_registrations);
   CreateActivationOpBuilder("LeakyRelu", op_registrations);
   CreateActivationOpBuilder("Gelu", op_registrations);
+  CreateActivationOpBuilder("Softplus", op_registrations);
+  CreateActivationOpBuilder("Elu", op_registrations);
+  CreateActivationOpBuilder("HardSigmoid", op_registrations);
+
+  // Microsoft-domain ops produced by ORT's own optimizer passes.
+  CreateQuickGeluOpBuilder("QuickGelu", op_registrations);
+  // FusedConv (from ConvActivationFusion) is handled by the same ConvOpBuilder
+  // class, which branches on op_type internally.
+  CreateConvOpBuilder("FusedConv", op_registrations);
 
   // Unary ops
+  CreateUnaryOpBuilder("Erf", op_registrations);
   CreateUnaryOpBuilder("Reciprocal", op_registrations);
+  CreateUnaryOpBuilder("Round", op_registrations);
   CreateUnaryOpBuilder("Sqrt", op_registrations);
+  CreateUnaryOpBuilder("Exp", op_registrations);
+  CreateUnaryOpBuilder("Sin", op_registrations);
+  CreateUnaryOpBuilder("Cos", op_registrations);
+  CreateUnaryOpBuilder("Ceil", op_registrations);
 
   // Binary elementwise ops
   CreateBinaryOpBuilder("Add", op_registrations);
   CreateBinaryOpBuilder("Div", op_registrations);
   CreateBinaryOpBuilder("Mul", op_registrations);
+  CreateBinaryOpBuilder("Max", op_registrations);
   CreateBinaryOpBuilder("Pow", op_registrations);
   CreateBinaryOpBuilder("Sub", op_registrations);
 
@@ -42,6 +58,9 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
 
   // Reduction ops
   CreateReductionOpBuilder("ReduceMean", op_registrations);
+  CreateReductionOpBuilder("ReduceMin", op_registrations);
+  CreateReductionOpBuilder("ReduceMax", op_registrations);
+  CreateReductionOpBuilder("ReduceProd", op_registrations);
   CreateReductionOpBuilder("ReduceSum", op_registrations);
 
   // Normalization ops
@@ -50,6 +69,7 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
   CreateNormalizationOpBuilder("InstanceNormalization", op_registrations);
   CreateNormalizationOpBuilder("LayerNormalization", op_registrations);
 
+  CreateLogicalOpBuilder("And", op_registrations);
   CreateArgMaxOpBuilder("ArgMax", op_registrations);
   CreateCastOpBuilder("Cast", op_registrations);
   CreateClipOpBuilder("Clip", op_registrations);
@@ -59,8 +79,10 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
   CreateDepthToSpaceOpBuilder("DepthToSpace", op_registrations);
   CreateFlattenOpBuilder("Flatten", op_registrations);
   CreateGatherOpBuilder("Gather", op_registrations);
+  CreateGatherNDOpBuilder("GatherND", op_registrations);
   CreateGemmOpBuilder("Gemm", op_registrations);
   CreateGridSampleOpBuilder("GridSample", op_registrations);
+  CreateIdentityOpBuilder("Identity", op_registrations);
   CreateLRNOpBuilder("LRN", op_registrations);
   CreateGemmOpBuilder("MatMul", op_registrations);
   CreatePadOpBuilder("Pad", op_registrations);
@@ -71,7 +93,10 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
   CreateSplitOpBuilder("Split", op_registrations);
   CreateSoftmaxOpBuilder("Softmax", op_registrations);
   CreateSqueezeOpBuilder("Squeeze", op_registrations);
+  CreateTileOpBuilder("Tile", op_registrations);
   CreateTransposeOpBuilder("Transpose", op_registrations);
+  CreateSqueezeOpBuilder("Unsqueeze", op_registrations);
+  CreateWhereOpBuilder("Where", op_registrations);
 
   return op_registrations;
 }

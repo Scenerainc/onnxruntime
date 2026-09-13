@@ -39,6 +39,7 @@ typedef NS_ENUM(int32_t, ORTTensorElementDataType) {
   ORTTensorElementDataTypeInt64,
   ORTTensorElementDataTypeUInt64,
   ORTTensorElementDataTypeString,
+  ORTTensorElementDataTypeBool,
 };
 
 /**
@@ -50,6 +51,7 @@ typedef NS_ENUM(int32_t, ORTGraphOptimizationLevel) {
   ORTGraphOptimizationLevelNone,
   ORTGraphOptimizationLevelBasic,
   ORTGraphOptimizationLevelExtended,
+  ORTGraphOptimizationLevelLayout,
   ORTGraphOptimizationLevelAll,
 };
 

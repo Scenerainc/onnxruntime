@@ -9,8 +9,8 @@
 
 // Public wrappers around internal ort interfaces (currently)
 #include "core/providers/shared_library/provider_host_api.h"
-
 #include "core/common/inlined_containers_fwd.h"
+#include "core/framework/resource_accountant.h"
 #include "core/providers/shared/common.h"
 
 #define PROVIDER_DISALLOW_ALL(TypeName)     \
@@ -37,10 +37,15 @@ namespace onnxruntime {
 struct ProviderHost;
 struct ProviderHostCPU;
 
+class ExternalDataInfo;
+
 class PhiloxGenerator;
 using ProviderType = const std::string&;
 class RandomGenerator;
+class Initializer;
 class IOnnxRuntimeOpSchemaCollection;
+
+struct ModelSavingOptions;
 
 #ifdef ENABLE_TRAINING_TORCH_INTEROP
 namespace contrib {
@@ -66,11 +71,25 @@ struct IteratorHolder {
   bool operator!=(const IteratorHolder& p) const { return p_->operator!=(*p.p_); }
 
   void operator++() { p_->operator++(); }
-  const TResult& operator*() { return p_->operator*(); }
+  TResult& operator*() { return p_->operator*(); }
   T* operator->() { return p_.get(); }
 
  private:
   std::unique_ptr<T> p_;
+};
+
+struct TensorProto_ConstIterator {
+  virtual ~TensorProto_ConstIterator() = default;
+  virtual bool operator!=(const TensorProto_ConstIterator& p) const = 0;
+  virtual void operator++() = 0;
+  virtual const ONNX_NAMESPACE::TensorProto& operator*() const = 0;
+};
+
+struct TensorProto_Iterator {
+  virtual ~TensorProto_Iterator() = default;
+  virtual bool operator!=(const TensorProto_Iterator& p) const = 0;
+  virtual void operator++() = 0;
+  virtual ONNX_NAMESPACE::TensorProto& operator*() const = 0;
 };
 
 struct NodeAttributes_Iterator {
@@ -103,6 +122,8 @@ using ModelMetaData = std::unordered_map<std::string, std::string>;
 using IOnnxRuntimeOpSchemaCollectionPtr = std::shared_ptr<IOnnxRuntimeOpSchemaCollection>;
 using IOnnxRuntimeOpSchemaRegistryList = std::list<IOnnxRuntimeOpSchemaCollectionPtr>;
 using InitializedTensorSet = std::unordered_map<std::string, const ONNX_NAMESPACE::TensorProto*>;
+using KeyValueConfig = std::unordered_map<std::string, std::string>;
+using SelectionFunc = std::function<std::vector<std::unique_ptr<ComputeCapability>>(const GraphViewer&, const KeyValueConfig&, const GraphOptimizerRegistry&)>;
 
 struct Node__NodeIterator {
   virtual ~Node__NodeIterator() {}
@@ -118,9 +139,18 @@ struct Node__EdgeIterator {
   virtual bool operator!=(const Node__EdgeIterator& p) const = 0;
 
   virtual void operator++() = 0;
+  virtual const Node_EdgeEnd& operator*() const = 0;
   virtual const Node& GetNode() const = 0;
   virtual int GetSrcArgIndex() const = 0;
   virtual int GetDstArgIndex() const = 0;
+};
+
+struct ConstGraphNodes_Iterator {
+  virtual ~ConstGraphNodes_Iterator() {}
+
+  virtual bool operator!=(const ConstGraphNodes_Iterator& other) const = 0;
+  virtual void operator++() = 0;
+  virtual const Node& operator*() = 0;
 };
 
 // There are two ways to route a function, one is a virtual method and the other is a function pointer (or pointer to
@@ -139,6 +169,10 @@ struct Node__EdgeIterator {
 #endif
 struct ProviderHost {
   virtual const OrtApiBase* OrtGetApiBase() = 0;
+
+  virtual Status GetOptimizerByName(const std::string& name,
+                                    const GraphOptimizerRegistry& graph_optimizer_registry,
+                                    SelectionFunc& selection_func) = 0;
 
   virtual void* HeapAllocate(size_t size) = 0;
   virtual void HeapFree(void*) = 0;
@@ -167,9 +201,8 @@ struct ProviderHost {
   virtual std::string demangle(const char* name) = 0;
   virtual std::string demangle(const std::string& name) = 0;
 
-#ifdef USE_CUDA
   virtual std::unique_ptr<IAllocator> CreateCUDAAllocator(int16_t device_id, const char* name) = 0;
-  virtual std::unique_ptr<IAllocator> CreateCUDAPinnedAllocator(const char* name) = 0;
+  virtual std::unique_ptr<IAllocator> CreateCUDAPinnedAllocator(int16_t device_id, const char* name) = 0;
   virtual std::unique_ptr<IDataTransfer> CreateGPUDataTransfer() = 0;
 
   virtual void cuda__Impl_Cast(void* stream, const int64_t* input_data, int32_t* output_data, size_t count) = 0;
@@ -179,30 +212,14 @@ struct ProviderHost {
 
   virtual Status CudaCall_false(int retCode, const char* exprString, const char* libName, int successCode, const char* msg, const char* file, const int line) = 0;
   virtual void CudaCall_true(int retCode, const char* exprString, const char* libName, int successCode, const char* msg, const char* file, const int line) = 0;
-#endif
 
-#ifdef USE_MIGRAPHX
   virtual std::unique_ptr<IAllocator> CreateMIGraphXAllocator(int16_t device_id, const char* name) = 0;
   virtual std::unique_ptr<IAllocator> CreateMIGraphXPinnedAllocator(int16_t device_id, const char* name) = 0;
-#endif
-
-#ifdef USE_ROCM
-  virtual std::unique_ptr<IAllocator> CreateROCMAllocator(int16_t device_id, const char* name) = 0;
-  virtual std::unique_ptr<IAllocator> CreateROCMPinnedAllocator(const char* name) = 0;
-  virtual std::unique_ptr<IDataTransfer> CreateGPUDataTransfer() = 0;
-
-  virtual void rocm__Impl_Cast(void* stream, const int64_t* input_data, int32_t* output_data, size_t count) = 0;
-  virtual void rocm__Impl_Cast(void* stream, const int32_t* input_data, int64_t* output_data, size_t count) = 0;
-  virtual void rocm__Impl_Cast(void* stream, const double* input_data, float* output_data, size_t count) = 0;
-  virtual void rocm__Impl_Cast(void* stream, const float* input_data, double* output_data, size_t count) = 0;
-
-  virtual Status RocmCall_false(int retCode, const char* exprString, const char* libName, int successCode, const char* msg, const char* file, const int line) = 0;
-  virtual void RocmCall_true(int retCode, const char* exprString, const char* libName, int successCode, const char* msg, const char* file, const int line) = 0;
-#endif
 
   virtual std::unordered_set<NodeIndex> GetCpuPreferredNodes(const onnxruntime::GraphViewer& graph,
                                                              const IExecutionProvider::IKernelLookup& kernel_lookup,
-                                                             gsl::span<const NodeIndex> tentative_nodes) = 0;
+                                                             gsl::span<const NodeIndex> tentative_nodes,
+                                                             const logging::Logger& logger) = 0;
 
   virtual Status UnpackTensor(const ONNX_NAMESPACE::TensorProto& tensor, const void* raw_data, size_t raw_data_len, /*out*/ bool* p_data, size_t expected_size) = 0;
   virtual Status UnpackTensor(const ONNX_NAMESPACE::TensorProto& tensor, const void* raw_data, size_t raw_data_len, /*out*/ float* p_data, size_t expected_size) = 0;
@@ -241,9 +258,15 @@ struct ProviderHost {
   // IAllocator
   virtual bool IAllocator__CalcMemSizeForArrayWithAlignment(size_t nmemb, size_t size, size_t alignment, size_t* out) = 0;
 
+  // IExecutionProviderFactory
+  virtual std::unique_ptr<IExecutionProvider> IExecutionProviderFactory__CreateProvider(
+      IExecutionProviderFactory* p, const OrtSessionOptions& session_options, const OrtLogger& session_logger) = 0;
+
   // IExecutionProvider
   virtual std::vector<std::unique_ptr<ComputeCapability>> IExecutionProvider__GetCapability(const IExecutionProvider* p, const onnxruntime::GraphViewer& graph_viewer,
-                                                                                            const IExecutionProvider::IKernelLookup& kernel_lookup) = 0;
+                                                                                            const IExecutionProvider::IKernelLookup& kernel_lookup,
+                                                                                            const GraphOptimizerRegistry& graph_optimizer_registry,
+                                                                                            IResourceAccountant* resource_accountant) = 0;
 
   virtual common::Status IExecutionProvider__Compile(IExecutionProvider* p, const std::vector<IExecutionProvider::FusedNodeAndGraph>& fused_nodes_and_graphs, std::vector<NodeComputeInfo>& node_compute_funcs) = 0;
 
@@ -270,20 +293,41 @@ struct ProviderHost {
 
   // logging::Logger
   virtual bool logging__Logger__OutputIsEnabled(const logging::Logger* p, logging::Severity severity, logging::DataType data_type) = 0;
+  virtual logging::Severity logging__Logger__GetSeverity(const logging::Logger* p) = 0;
 
   // logging::LoggingManager
   virtual const logging::Logger& logging__LoggingManager__DefaultLogger() = 0;
+  virtual bool logging__LoggingManager__HasDefaultLogger() = 0;
 
   // logging::Capture
-  virtual std::unique_ptr<logging::Capture> logging__Capture__construct(const logging::Logger& logger, logging::Severity severity, const char* category, logging::DataType dataType, const CodeLocation& location) = 0;
+  virtual std::unique_ptr<logging::Capture> logging__Capture__construct(const logging::Logger& logger,
+                                                                        logging::Severity severity,
+                                                                        const char* category,
+                                                                        logging::DataType data_type,
+                                                                        const CodeLocation& location) = 0;
   virtual void logging__Capture__operator_delete(logging::Capture* p) noexcept = 0;
   virtual std::ostream& logging__Capture__Stream(logging::Capture* p) noexcept = 0;
+  virtual void logging__Capture__ProcessPrintf(logging::Capture* p, const char* format, va_list args) = 0;
+
+#if defined(_WIN32)
+  // logging::EtwRegistrationManager
+  virtual logging::EtwRegistrationManager& logging__EtwRegistrationManager__Instance() = 0;
+  virtual bool logging__EtwRegistrationManager__SupportsETW() = 0;
+  virtual logging::Severity logging__EtwRegistrationManager__MapLevelToSeverity(logging::EtwRegistrationManager* p) = 0;
+  virtual void logging__EtwRegistrationManager__RegisterInternalCallback(
+      logging::EtwRegistrationManager* p,
+      const logging::EtwRegistrationManager_EtwInternalCallback& callback) = 0;
+  virtual void logging__EtwRegistrationManager__UnregisterInternalCallback(
+      logging::EtwRegistrationManager* p,
+      const logging::EtwRegistrationManager_EtwInternalCallback& callback) = 0;
+#endif  // defined(_WIN32)
 
   // Env
   virtual Env& Env__Default() = 0;
 
   // Utils::DataTypeUtils
   virtual const std::string* Utils__DataTypeUtils__ToType(const ONNX_NAMESPACE::TypeProto& type_proto) = 0;
+  virtual const std::string* Utils__DataTypeUtils__ToType(const std::string& type_str) = 0;
 
   // int64s
   virtual int int64s__size(const ONNX_NAMESPACE::int64s* p) = 0;
@@ -325,6 +369,7 @@ struct ProviderHost {
   virtual bool TypeProto_Tensor__has_shape(const ONNX_NAMESPACE::TypeProto_Tensor* p) = 0;
   virtual const ONNX_NAMESPACE::TensorShapeProto& TypeProto_Tensor__shape(const ONNX_NAMESPACE::TypeProto_Tensor* p) = 0;
   virtual ONNX_NAMESPACE::TensorShapeProto* TypeProto_Tensor__mutable_shape(ONNX_NAMESPACE::TypeProto_Tensor* p) = 0;
+  virtual bool TypeProto_Tensor__has_elem_type(const ONNX_NAMESPACE::TypeProto_Tensor* p) = 0;
   virtual int32_t TypeProto_Tensor__elem_type(const ONNX_NAMESPACE::TypeProto_Tensor* p) = 0;
   virtual void TypeProto_Tensor__set_elem_type(ONNX_NAMESPACE::TypeProto_Tensor* p, int32_t value) = 0;
 
@@ -338,7 +383,9 @@ struct ProviderHost {
 
   // TypeProto
   virtual std::unique_ptr<ONNX_NAMESPACE::TypeProto> TypeProto__construct() = 0;
+  virtual void TypeProto__operator_delete(ONNX_NAMESPACE::TypeProto* p) = 0;
   virtual void TypeProto__CopyFrom(ONNX_NAMESPACE::TypeProto* p, const ONNX_NAMESPACE::TypeProto* other) = 0;
+  virtual bool TypeProto__has_tensor_type(const ONNX_NAMESPACE::TypeProto* p) = 0;
   virtual const ONNX_NAMESPACE::TypeProto_Tensor& TypeProto__tensor_type(const ONNX_NAMESPACE::TypeProto* p) = 0;
   virtual ONNX_NAMESPACE::TypeProto_Tensor* TypeProto__mutable_tensor_type(ONNX_NAMESPACE::TypeProto* p) = 0;
 
@@ -389,11 +436,13 @@ struct ProviderHost {
   virtual void AttributeProto__set_name(ONNX_NAMESPACE::AttributeProto* p, const ::std::string& value) = 0;
   virtual void AttributeProto__set_type(ONNX_NAMESPACE::AttributeProto* p, ONNX_NAMESPACE::AttributeProto_AttributeType value) = 0;
   virtual ONNX_NAMESPACE::TensorProto* AttributeProto__add_tensors(ONNX_NAMESPACE::AttributeProto* p) = 0;
+  virtual std::string* AttributeProto__release_s(ONNX_NAMESPACE::AttributeProto* p) = 0;
 
   // GraphProto
   virtual std::unique_ptr<ONNX_NAMESPACE::GraphProto> GraphProto__construct() = 0;
   virtual void GraphProto__operator_delete(ONNX_NAMESPACE::GraphProto* p) = 0;
-  virtual void GraphProto__operator_assign(ONNX_NAMESPACE::GraphProto* p, const ONNX_NAMESPACE::GraphProto& v) = 0;
+  virtual ONNX_NAMESPACE::GraphProto& GraphProto__operator_assign(ONNX_NAMESPACE::GraphProto* p, const ONNX_NAMESPACE::GraphProto& v) = 0;
+  virtual ONNX_NAMESPACE::GraphProto& GraphProto__operator_move_assign(ONNX_NAMESPACE::GraphProto* p, ONNX_NAMESPACE::GraphProto&& v) = 0;
 
   virtual const ONNX_NAMESPACE::ValueInfoProto& GraphProto__input(const ONNX_NAMESPACE::GraphProto* p, int index) = 0;
   virtual ONNX_NAMESPACE::ValueInfoProtos* GraphProto__mutable_input(ONNX_NAMESPACE::GraphProto* p) = 0;
@@ -446,7 +495,8 @@ struct ProviderHost {
   // TensorProto
   virtual std::unique_ptr<ONNX_NAMESPACE::TensorProto> TensorProto__construct() = 0;
   virtual void TensorProto__operator_delete(ONNX_NAMESPACE::TensorProto* p) = 0;
-  virtual void TensorProto__operator_assign(ONNX_NAMESPACE::TensorProto* p, const ONNX_NAMESPACE::TensorProto& v) = 0;
+  virtual ONNX_NAMESPACE::TensorProto& TensorProto__operator_assign(ONNX_NAMESPACE::TensorProto* p, const ONNX_NAMESPACE::TensorProto& v) = 0;
+  virtual ONNX_NAMESPACE::TensorProto& TensorProto__operator_move_assign(ONNX_NAMESPACE::TensorProto* p, ONNX_NAMESPACE::TensorProto&& v) = 0;
   virtual bool TensorProto__has_name(const ONNX_NAMESPACE::TensorProto* p) = 0;
   virtual void TensorProto__set_name(ONNX_NAMESPACE::TensorProto* p, const ::std::string& name) = 0;
   virtual const ::std::string& TensorProto__name(const ONNX_NAMESPACE::TensorProto* p) = 0;
@@ -458,6 +508,7 @@ struct ProviderHost {
   virtual bool TensorProto__has_raw_data(const ONNX_NAMESPACE::TensorProto* p) = 0;
   virtual const std::string& TensorProto__raw_data(const ONNX_NAMESPACE::TensorProto* p) = 0;
   virtual std::string* TensorProto__mutable_raw_data(ONNX_NAMESPACE::TensorProto* p) = 0;
+  virtual bool TensorProto__has_data_type(const ONNX_NAMESPACE::TensorProto* p) = 0;
   virtual int32_t TensorProto__data_type(const ONNX_NAMESPACE::TensorProto* p) = 0;
   virtual void TensorProto__set_data_type(ONNX_NAMESPACE::TensorProto* p, int32_t type) = 0;
   virtual void TensorProto__CopyFrom(ONNX_NAMESPACE::TensorProto* p, const ONNX_NAMESPACE::TensorProto* other) = 0;
@@ -474,8 +525,12 @@ struct ProviderHost {
 
   // TensorProtos
   virtual ONNX_NAMESPACE::TensorProto* TensorProtos__Add(ONNX_NAMESPACE::TensorProtos* p) = 0;
-  virtual int TensorProtos__size(ONNX_NAMESPACE::TensorProtos* p) = 0;
+  virtual int TensorProtos__size(const ONNX_NAMESPACE::TensorProtos* p) = 0;
   virtual ONNX_NAMESPACE::TensorProto& TensorProtos__at(ONNX_NAMESPACE::TensorProtos* p, int index) = 0;
+  virtual std::unique_ptr<TensorProto_ConstIterator> TensorProtos__begin(const ONNX_NAMESPACE::TensorProtos* p) = 0;
+  virtual std::unique_ptr<TensorProto_ConstIterator> TensorProtos__end(const ONNX_NAMESPACE::TensorProtos* p) = 0;
+  virtual std::unique_ptr<TensorProto_Iterator> TensorProtos__begin(ONNX_NAMESPACE::TensorProtos* p) = 0;
+  virtual std::unique_ptr<TensorProto_Iterator> TensorProtos__end(ONNX_NAMESPACE::TensorProtos* p) = 0;
 
   // TensorShapeProto_Dimension
   virtual int TensorShapeProto_Dimension__value_case(const ONNX_NAMESPACE::TensorShapeProto_Dimension* p) = 0;
@@ -491,6 +546,7 @@ struct ProviderHost {
   // TensorShapeProto_Dimensions
   virtual std::unique_ptr<TensorShapeProto_Dimension_Iterator> TensorShapeProto_Dimensions__begin(const ONNX_NAMESPACE::TensorShapeProto_Dimensions* p) = 0;
   virtual std::unique_ptr<TensorShapeProto_Dimension_Iterator> TensorShapeProto_Dimensions__end(const ONNX_NAMESPACE::TensorShapeProto_Dimensions* p) = 0;
+  virtual size_t TensorShapeProto_Dimensions__size(const ONNX_NAMESPACE::TensorShapeProto_Dimensions* p) = 0;
 
   // TensorShapeProto
   virtual int TensorShapeProto__dim_size(const ONNX_NAMESPACE::TensorShapeProto* p) = 0;
@@ -568,7 +624,10 @@ struct ProviderHost {
   virtual int FunctionProto__metadata_props_size(const ONNX_NAMESPACE::FunctionProto* p) = 0;
   virtual ONNX_NAMESPACE::StringStringEntryProto* FunctionProto__add_metadata_props(ONNX_NAMESPACE::FunctionProto* p) = 0;
 
+  virtual void InferShapes(const std::string& m, const std::string& save_path) = 0;
+  virtual void InferShapes(ONNX_NAMESPACE::ModelProto& m) = 0;
   virtual void RegisterSchema(const std::string& domain, const OrtCustomOp* op) = 0;
+  virtual void DeregisterSchema(const std::string& domain, const std::string& op_type, int version) = 0;
   virtual const ONNX_NAMESPACE::OpSchema* GetSchema(const std::string& name, const int maxInclusiveVersion, const std::string& domain) = 0;
   virtual const std::string& OpSchema__inputs__GetName(const ONNX_NAMESPACE::OpSchema* p, const size_t i) = 0;
   virtual const std::string& OpSchema__inputs__GetTypeStr(const ONNX_NAMESPACE::OpSchema* p, const size_t i) = 0;
@@ -580,15 +639,20 @@ struct ProviderHost {
   virtual std::optional<std::string> ConfigOptions__GetConfigEntry(const ConfigOptions* p, const std::string& config_key) = 0;
   virtual std::string ConfigOptions__GetConfigOrDefault(const ConfigOptions* p, const std::string& config_key,
                                                         const std::string& default_value) = 0;
+  virtual const std::unordered_map<std::string, std::string>& ConfigOptions__GetConfigOptionsMap(const ConfigOptions* p) = 0;
 
   // OrtRunOptions
   virtual const ConfigOptions& RunOptions__GetConfigOptions(const RunOptions* p) = 0;
   // OrtSessionOptions
   virtual const std::unordered_map<std::string, std::string>& SessionOptions__GetConfigOptionsMap(const OrtSessionOptions* p) = 0;
+  virtual const ConfigOptions& SessionOptions__GetConfigOptions(const OrtSessionOptions* p) = 0;
+  virtual bool SessionOptions__GetEnableProfiling(const OrtSessionOptions* p) = 0;
   // ComputeCapability
   virtual std::unique_ptr<ComputeCapability> ComputeCapability__construct(std::unique_ptr<IndexedSubGraph> t_sub_graph) = 0;
   virtual void ComputeCapability__operator_delete(ComputeCapability* p) = 0;
   virtual std::unique_ptr<IndexedSubGraph>& ComputeCapability__SubGraph(ComputeCapability* p) = 0;
+  virtual void ComputeCapability__copy_optimization_func(ComputeCapability* p, ComputeCapability* selection_cc) = 0;
+  virtual void ComputeCapability__add_nodes_to_optimize(ComputeCapability* p, std::unique_ptr<ComputeCapability> optimization_cc) = 0;
 
   // DataTransferManager
   virtual Status DataTransferManager__CopyTensor(const DataTransferManager* p, const Tensor& src, Tensor& dst) = 0;
@@ -623,6 +687,7 @@ struct ProviderHost {
   virtual std::unique_ptr<IndexedSubGraph> IndexedSubGraph__construct() = 0;
   virtual void IndexedSubGraph__operator_delete(IndexedSubGraph* p) = 0;
 
+  virtual const std::vector<onnxruntime::NodeIndex>& IndexedSubGraph__Nodes(const IndexedSubGraph* p) = 0;
   virtual std::vector<onnxruntime::NodeIndex>& IndexedSubGraph__Nodes(IndexedSubGraph* p) = 0;
 
   virtual void IndexedSubGraph__SetMetaDef(IndexedSubGraph* p, std::unique_ptr<IndexedSubGraph_MetaDef>&& meta_def_) = 0;
@@ -630,6 +695,8 @@ struct ProviderHost {
 
   virtual void IndexedSubGraph__SetSchemaSource(IndexedSubGraph* p, IndexedSubGraph_SourceOfSchema schema_source) = 0;
   virtual IndexedSubGraph_SourceOfSchema IndexedSubGraph__GetSchemaSource(const IndexedSubGraph* p) = 0;
+  virtual void IndexedSubGraph__SetAccountant(IndexedSubGraph* p, IResourceAccountant*) = 0;
+  virtual void IndexedSubGraph__AppendNodeCost(IndexedSubGraph* p, const ResourceCount& count) = 0;
 
   // KernelDef
   virtual void KernelDef__operator_delete(KernelDef* p) = 0;
@@ -703,8 +770,13 @@ struct ProviderHost {
   virtual MLDataType DataTypeImpl__GetType_Float8E5M2() = 0;
   virtual MLDataType DataTypeImpl__GetType_Float8E5M2FNUZ() = 0;
 #endif
+#if !defined(DISABLE_FLOAT4_TYPES)
+  virtual MLDataType DataTypeImpl__GetType_Float4E2M1x2() = 0;
+#endif
   virtual MLDataType DataTypeImpl__GetType_Int4x2() = 0;
   virtual MLDataType DataTypeImpl__GetType_UInt4x2() = 0;
+  virtual MLDataType DataTypeImpl__GetType_Int2x4() = 0;
+  virtual MLDataType DataTypeImpl__GetType_UInt2x4() = 0;
 
   virtual MLDataType DataTypeImpl__GetTensorTypeFromOnnxType(int) = 0;
   virtual MLDataType DataTypeImpl__GetTensorType_bool() = 0;
@@ -726,8 +798,14 @@ struct ProviderHost {
   virtual MLDataType DataTypeImpl__GetTensorType_Float8E5M2() = 0;
   virtual MLDataType DataTypeImpl__GetTensorType_Float8E5M2FNUZ() = 0;
 #endif
+#if !defined(DISABLE_FLOAT4_TYPES)
+  virtual MLDataType DataTypeImpl__GetTensorType_Float4E2M1x2() = 0;
+#endif
+
   virtual MLDataType DataTypeImpl__GetTensorType_Int4x2() = 0;
   virtual MLDataType DataTypeImpl__GetTensorType_UInt4x2() = 0;
+  virtual MLDataType DataTypeImpl__GetTensorType_Int2x4() = 0;
+  virtual MLDataType DataTypeImpl__GetTensorType_UInt2x4() = 0;
 
 #if !defined(DISABLE_SPARSE_TENSORS)
   virtual MLDataType DataTypeImpl__GetSparseTensorType_bool() = 0;
@@ -768,6 +846,8 @@ struct ProviderHost {
   virtual const std::vector<MLDataType>& DataTypeImpl__AllTensorTypes() = 0;
   virtual const std::vector<MLDataType>& DataTypeImpl__AllTensorTypesIRv4() = 0;
   virtual const std::vector<MLDataType>& DataTypeImpl__AllTensorTypesIRv9() = 0;
+  virtual const std::vector<MLDataType>& DataTypeImpl__AllTensorTypesIRv10() = 0;
+  virtual const std::vector<MLDataType>& DataTypeImpl__AllTensorTypesIRv11() = 0;
 
   virtual const std::vector<MLDataType>& DataTypeImpl__AllIEEEFloatTensorTypes() = 0;
 
@@ -818,6 +898,8 @@ struct ProviderHost {
 
   virtual const NodeAttributes& Node__GetAttributes(const Node* p) noexcept = 0;
   virtual void Node__AddAttribute(Node* p, const ::std::string& attr_name, const ONNX_NAMESPACE::GraphProto& value) = 0;
+  virtual void Node__AddAttribute(Node* p, const ::std::string& attr_name, const std::string& value) = 0;
+  virtual void Node__AddAttribute(Node* p, const ::std::string& attr_name, int64_t value) = 0;
   virtual size_t Node__GetInputEdgesCount(const Node* p) noexcept = 0;
   virtual size_t Node__GetOutputEdgesCount(const Node* p) noexcept = 0;
 
@@ -836,6 +918,11 @@ struct ProviderHost {
   virtual int Node__NodeType(const Node* p) const noexcept = 0;
   virtual const std::unordered_map<std::string, gsl::not_null<Graph*>>& Node__GetAttributeNameToMutableSubgraphMap(Node* p) = 0;
   virtual std::unordered_map<std::string, gsl::not_null<const Graph*>> Node__GetAttributeNameToSubgraphMap(const Node* p) const = 0;
+
+  // Node_EdgeEnd
+  virtual const Node& Node_EdgeEnd__GetNode(const Node_EdgeEnd* p) = 0;
+  virtual int Node_EdgeEnd__GetSrcArgIndex(const Node_EdgeEnd* p) = 0;
+  virtual int Node_EdgeEnd__GetDstArgIndex(const Node_EdgeEnd* p) = 0;
 
   // NodeArg
   virtual const std::string& NodeArg__Name(const NodeArg* p) noexcept = 0;
@@ -867,6 +954,8 @@ struct ProviderHost {
   virtual void NodeAttributes__reserve(NodeAttributes* p, size_t size) = 0;
 
   // NodeUnit
+  virtual void NodeUnit__operator_delete(NodeUnit* p) noexcept = 0;
+
   virtual int NodeUnit__UnitType(const NodeUnit* p) noexcept = 0;
 
   virtual const std::vector<NodeUnitIODef>& NodeUnit__Inputs(const NodeUnit* p) noexcept = 0;
@@ -890,16 +979,50 @@ struct ProviderHost {
   virtual std::unique_ptr<Node__EdgeIterator> NodeUnit__OutputEdgesEnd(const NodeUnit* p) = 0;
 
   virtual std::pair<std::vector<std::unique_ptr<NodeUnit>>, std::unordered_map<const Node*, const NodeUnit*>>
-  QDQ__GetAllNodeUnits(const GraphViewer* graph_viewer) = 0;
+  QDQ__GetAllNodeUnits(const GraphViewer* graph_viewer, const logging::Logger& logger) = 0;
+
+  // Partitioning utils
+  virtual std::vector<std::unique_ptr<ComputeCapability>>
+  Utils__CreateSupportedPartitions(const GraphViewer& graph_viewer,
+                                   const std::unordered_set<const Node*>& supported_nodes,
+                                   const std::unordered_set<std::string>& stop_ops,
+                                   const std::function<std::string()>& generate_metadef_name,
+                                   const std::string& execution_provider_name,
+                                   const std::string& execution_provider_type,
+                                   const std::unordered_map<const Node*, const NodeUnit*>* node_unit_map,
+                                   bool drop_constant_initializers) = 0;
+
+  virtual std::unique_ptr<ComputeCapability>
+  Utils__MakeComputeCapability(const GraphViewer& graph_viewer,
+                               const std::vector<const Node*>& group,
+                               const std::function<std::string()>& generate_metadef_name,
+                               const std::string& execution_provider_name,
+                               bool drop_constant_initializers) = 0;
+
+  virtual Status Utils__GetTensorProtoWithDataIfInMemory(
+      const ONNX_NAMESPACE::TensorProto& tensor_proto, std::unique_ptr<ONNX_NAMESPACE::TensorProto>& result) = 0;
+
+  virtual bool Utils__HasExternalDataInMemory(const ONNX_NAMESPACE::TensorProto& ten_proto) = 0;
+
+  virtual Status Utils__ValidateExternalDataPath(const std::filesystem::path& model_path,
+                                                 const std::filesystem::path& external_data_path) = 0;
+  virtual Status Utils__ValidateExternalDataPathFromDir(const std::filesystem::path& model_dir,
+                                                        const std::filesystem::path& external_data_path) = 0;
 
   // Model
   virtual std::unique_ptr<Model> Model__construct(ONNX_NAMESPACE::ModelProto&& model_proto, const PathString& model_path,
                                                   const IOnnxRuntimeOpSchemaRegistryList* local_registries,
                                                   const logging::Logger& logger) = 0;
+  virtual std::unique_ptr<Model> Model__construct(const std::string& graph_name, bool is_onnx_domain_only,
+                                                  const logging::Logger& logger) = 0;
   virtual void Model__operator_delete(Model* p) = 0;
   virtual Graph& Model__MainGraph(Model* p) = 0;
   virtual std::unique_ptr<ONNX_NAMESPACE::ModelProto> Model__ToProto(Model* p) = 0;
-  virtual std::unique_ptr<ONNX_NAMESPACE::ModelProto> Model__ToGraphProtoWithExternalInitializers(Model* p, const std::filesystem::path& external_file_name, const std::filesystem::path& file_path, size_t initializer_size_threshold) = 0;
+  virtual std::unique_ptr<ONNX_NAMESPACE::ModelProto> Model__ToGraphProtoWithExternalInitializers(
+      Model* p,
+      const std::filesystem::path& external_file_name,
+      const std::filesystem::path& file_path,
+      const ModelSavingOptions&) = 0;
   virtual const ModelMetaData& Model__MetaData(const Model* p) const noexcept = 0;
   virtual Status Model__Load(const PathString& file_path, /*out*/ ONNX_NAMESPACE::ModelProto& model_proto) = 0;
 
@@ -913,6 +1036,10 @@ struct ProviderHost {
   virtual const std::unordered_map<std::string, int>& Graph__DomainToVersionMap(const Graph* p) const noexcept = 0;
   virtual Status Graph__Resolve(Graph* p) = 0;
   virtual void Graph__AddInitializedTensor(Graph* p, const ONNX_NAMESPACE::TensorProto& tensor) = 0;
+  // We pass OrtValue by reference here (as opposed to the original Graph function) to avoid header inclusion
+  virtual Status Graph__AddInitializedOrtValue(Graph* p, const ONNX_NAMESPACE::TensorProto& tensor, const OrtValue& value) = 0;
+  virtual bool Graph__GetOrtValueInitializer(const Graph* p, const std::string& tensor_name, OrtValue& value,
+                                             bool check_outer_scope) = 0;
   virtual Node& Graph__AddNode(Graph* p, const std::string& name, const std::string& op_type, const std::string& description, const gsl::span<NodeArg* const>& input_args, const gsl::span<NodeArg* const>& output_args, const NodeAttributes* attributes, const std::string& domain) = 0;
   virtual Node& Graph__AddNode(Graph* p, const std::string& name, const std::string& op_type, const std::string& description, const gsl::span<NodeArg* const>& input_args, const gsl::span<NodeArg* const>& output_args, NodeAttributes&& attributes, const std::string& domain) = 0;
   virtual Node& Graph__AddNode(Graph* p, const Node& other) = 0;
@@ -928,6 +1055,7 @@ struct ProviderHost {
   virtual const Graph* Graph__ParentGraph(const Graph* p) const = 0;
   virtual Graph* Graph__MutableParentGraph(Graph* p) = 0;
   virtual const std::string& Graph__Name(const Graph* p) const noexcept = 0;
+  virtual void Graph__SetName(Graph* p, const std::string& name) const noexcept = 0;
   virtual const std::filesystem::path& Graph__ModelPath(const Graph* p) const = 0;
   virtual const std::vector<const NodeArg*>& Graph__GetInputsIncludingInitializers(const Graph* p) const noexcept = 0;
   virtual bool Graph__IsSubgraph(const Graph* p) = 0;
@@ -960,11 +1088,12 @@ struct ProviderHost {
 
   // GraphViewer
   virtual void GraphViewer__operator_delete(GraphViewer* p) = 0;
-  virtual std::unique_ptr<Model> GraphViewer__CreateModel(const GraphViewer* p, const logging::Logger& logger) = 0;
+  virtual std::unique_ptr<Model> GraphViewer__CreateModel(const GraphViewer* p, const logging::Logger& logger, const ModelMetaData&) = 0;
 
   virtual const std::string& GraphViewer__Name(const GraphViewer* p) noexcept = 0;
   virtual const std::filesystem::path& GraphViewer__ModelPath(const GraphViewer* p) noexcept = 0;
 
+  virtual const ConstGraphNodes& GraphViewer__Nodes(const GraphViewer* p) noexcept = 0;
   virtual const Node* GraphViewer__GetNode(const GraphViewer* p, NodeIndex node_index) = 0;
   virtual const NodeArg* GraphViewer__GetNodeArg(const GraphViewer* p, const std::string& name) = 0;
 
@@ -974,12 +1103,15 @@ struct ProviderHost {
   virtual const ONNX_NAMESPACE::TensorProto* GraphViewer__GetConstantInitializer(const GraphViewer* p,
                                                                                  const std::string& name,
                                                                                  bool check_outer_scope) const = 0;
+  virtual bool GraphViewer__GetOrtValueInitializer(const GraphViewer* p, const std::string& tensor_name,
+                                                   OrtValue& value) = 0;
   virtual const Node* GraphViewer__ParentNode(const GraphViewer* p) = 0;
   virtual int GraphViewer__NumberOfNodes(const GraphViewer* p) noexcept = 0;
   virtual int GraphViewer__MaxNodeIndex(const GraphViewer* p) noexcept = 0;
 
   virtual const std::vector<const NodeArg*>& GraphViewer__GetInputs(const GraphViewer* p) noexcept = 0;
   virtual const std::vector<const NodeArg*>& GraphViewer__GetOutputs(const GraphViewer* p) noexcept = 0;
+  virtual bool GraphViewer__NodeProducesGraphOutput(const GraphViewer* p, const Node& node) = 0;
   virtual const std::unordered_set<const NodeArg*>& GraphViewer__GetValueInfo(const GraphViewer* p) noexcept = 0;
 
   virtual const InitializedTensorSet& GraphViewer__GetAllInitializedTensors(const GraphViewer* p) = 0;
@@ -994,8 +1126,57 @@ struct ProviderHost {
                                     ONNX_NAMESPACE::GraphProto& graph_proto,
                                     bool include_initializers,
                                     bool include_outer_scope_args,
-                                    int execution_order) noexcept = 0;
+                                    int execution_order,
+                                    bool include_initializer_data) noexcept = 0;
   virtual const Node* GraphViewer__GetProducerNode(const GraphViewer* p, const std::string& node_arg_name) const = 0;
+  virtual IOnnxRuntimeOpSchemaCollectionPtr GraphViewer__GetSchemaRegistry(const GraphViewer* p) const = 0;
+
+  // ConstGraphNodes
+  virtual std::unique_ptr<ConstGraphNodes_Iterator> ConstGraphNodes__begin(const ConstGraphNodes* p) = 0;
+  virtual std::unique_ptr<ConstGraphNodes_Iterator> ConstGraphNodes__end(const ConstGraphNodes* p) = 0;
+  virtual std::unique_ptr<ConstGraphNodes_Iterator> ConstGraphNodes__cbegin(const ConstGraphNodes* p) = 0;
+  virtual std::unique_ptr<ConstGraphNodes_Iterator> ConstGraphNodes__cend(const ConstGraphNodes* p) = 0;
+  virtual bool ConstGraphNodes__empty(const ConstGraphNodes* p) noexcept = 0;
+
+  // graph_util
+  virtual NodeArg& GraphUtils__AddInitializerWithExternalData(Graph& graph,
+                                                              const ONNX_NAMESPACE::TensorProto& new_initializer) = 0;
+  virtual void GraphUtils__MakeInitializerCopyIfNotExist(const Graph& src_graph, Graph& dst_graph,
+                                                         const std::string& name, bool load_inline) = 0;
+
+  virtual Status GraphUtils__ConvertInMemoryDataToInline(Graph& graph, const std::string& name) = 0;
+
+  // ExternalDataInfo
+  virtual void ExternalDataInfo__operator_delete(ExternalDataInfo*) = 0;
+  virtual const PathString& ExternalDataInfo__GetRelPath(const ExternalDataInfo*) const = 0;
+  virtual int64_t ExternalDataInfo__GetOffset(const ExternalDataInfo*) const = 0;
+  virtual size_t ExternalDataInfo__GetLength(const ExternalDataInfo*) const = 0;
+  virtual const std::string& ExternalDataInfo__GetChecksum(const ExternalDataInfo*) const = 0;
+  virtual Status ExternalDataInfo__Create(const ONNX_NAMESPACE::StringStringEntryProtos& input,
+                                          std::unique_ptr<ExternalDataInfo>& out) = 0;
+
+  // Initializer
+  virtual Initializer* Initializer__constructor(ONNX_NAMESPACE::TensorProto_DataType data_type,
+                                                std::string_view name,
+                                                gsl::span<const int64_t> dims) = 0;
+  virtual Initializer* Initializer__constructor(const Graph& graph, const ONNX_NAMESPACE::TensorProto& tensor_proto,
+                                                const std::filesystem::path& model_path = {},
+                                                bool check_outer_scope = false) = 0;
+
+  virtual void Initializer__destructor(Initializer*) = 0;
+  virtual void Initializer__ToProto(const Initializer&,
+                                    ONNX_NAMESPACE::TensorProto& tensor_proto) = 0;
+  virtual void Initializer__ToProtoWithOrtValue(const Initializer&,
+                                                ONNX_NAMESPACE::TensorProto& tensor_proto, OrtValue& ort_value) = 0;
+  virtual int Initializer__data_type(const Initializer&) = 0;
+  virtual const std::string& Initializer__name(const Initializer&) = 0;
+  virtual gsl::span<const int64_t> Initializer__dims(const Initializer&) = 0;
+  virtual size_t Initializer__size(const Initializer&) = 0;
+  // data<T>() template helper
+  virtual void* Initializer__mutable_data(Initializer&, int data_type) = 0;
+  virtual const void* Initializer__data(const Initializer&, int data_type) = 0;
+  virtual void* Initializer__mutable_data_raw(Initializer&) = 0;
+  virtual const void* Initializer__data_raw(const Initializer&) = 0;
 
   // OpKernel
   virtual const Node& OpKernel__Node(const OpKernel* p) = 0;
@@ -1080,8 +1261,13 @@ struct ProviderHost {
   virtual Float8E5M2* Tensor__MutableData_Float8E5M2(Tensor* p) = 0;
   virtual Float8E5M2FNUZ* Tensor__MutableData_Float8E5M2FNUZ(Tensor* p) = 0;
 #endif
+#if !defined(DISABLE_FLOAT4_TYPES)
+  virtual Float4E2M1x2* Tensor__MutableData_Float4E2M1x2(Tensor* p) = 0;
+#endif
   virtual Int4x2* Tensor__MutableData_Int4x2(Tensor* p) = 0;
   virtual UInt4x2* Tensor__MutableData_UInt4x2(Tensor* p) = 0;
+  virtual Int2x4* Tensor__MutableData_Int2x4(Tensor* p) = 0;
+  virtual UInt2x4* Tensor__MutableData_UInt2x4(Tensor* p) = 0;
 
   virtual const bool* Tensor__Data_bool(const Tensor* p) = 0;
   virtual const int8_t* Tensor__Data_int8(const Tensor* p) = 0;
@@ -1103,10 +1289,16 @@ struct ProviderHost {
   virtual const Float8E5M2* Tensor__Data_Float8E5M2(const Tensor* p) = 0;
   virtual const Float8E5M2FNUZ* Tensor__Data_Float8E5M2FNUZ(const Tensor* p) = 0;
 #endif
+#if !defined(DISABLE_FLOAT4_TYPES)
+  virtual const Float4E2M1x2* Tensor__Data_Float4E2M1x2(const Tensor* p) = 0;
+#endif
   virtual const Int4x2* Tensor__Data_Int4x2(const Tensor* p) = 0;
   virtual const UInt4x2* Tensor__Data_UInt4x2(const Tensor* p) = 0;
+  virtual const Int2x4* Tensor__Data_Int2x4(const Tensor* p) = 0;
+  virtual const UInt2x4* Tensor__Data_UInt2x4(const Tensor* p) = 0;
 
   virtual gsl::span<const int64_t> Tensor__DataAsSpan_int64(const Tensor* p) = 0;
+  virtual gsl::span<const int32_t> Tensor__DataAsSpan_int32(const Tensor* p) = 0;
 
   virtual void* Allocator__AllocateBufferWithOptions(IAllocator& allocator, size_t size, bool use_reserve, Stream* stream, WaitNotificationFn wait_fn) = 0;
 
@@ -1136,8 +1328,13 @@ struct ProviderHost {
   virtual bool Tensor__IsDataType_Float8E5M2(const Tensor* p) noexcept = 0;
   virtual bool Tensor__IsDataType_Float8E5M2FNUZ(const Tensor* p) noexcept = 0;
 #endif
+#if !defined(DISABLE_FLOAT4_TYPES)
+  virtual bool Tensor__IsDataType_Float4E2M1x2(const Tensor* p) noexcept = 0;
+#endif
   virtual bool Tensor__IsDataType_Int4x2(const Tensor* p) noexcept = 0;
   virtual bool Tensor__IsDataType_UInt4x2(const Tensor* p) noexcept = 0;
+  virtual bool Tensor__IsDataType_Int2x4(const Tensor* p) noexcept = 0;
+  virtual bool Tensor__IsDataType_UInt2x4(const Tensor* p) noexcept = 0;
 
   virtual const TensorShape& Tensor__Shape(const Tensor* p) = 0;
   virtual void Tensor__Reshape(Tensor* p, const TensorShape& new_shape) = 0;
@@ -1175,9 +1372,7 @@ struct ProviderHost {
   virtual training::DistributedRunContext& GetDistributedRunContextInstance() = 0;
 #endif
 
-#if defined(USE_CUDA) || defined(USE_ROCM)
   virtual PhiloxGenerator& PhiloxGenerator__Default() = 0;
-#endif
 
 #ifdef ENABLE_TRAINING_TORCH_INTEROP
   virtual void contrib__PythonOpBase__Init(contrib::PythonOpBase* p, const OpKernelInfo& info) = 0;
@@ -1198,7 +1393,7 @@ struct ProviderHost {
   virtual std::unique_ptr<Model> cann__CreateModel(const GraphViewer& graph_viewer, const logging::Logger& logger) = 0;
 #endif
 
-  virtual void MurmurHash3__x86_128(const void* key, int len, uint32_t seed, void* out) = 0;
+  virtual void MurmurHash3__x86_128(const void* key, size_t len, uint32_t seed, void* out) = 0;
 
 #ifdef _WIN32
   virtual std::string ToUTF8String(const std::wstring& s) = 0;
@@ -1215,6 +1410,18 @@ struct ProviderHost {
   virtual std::unique_ptr<ModelMetadefIdGenerator> ModelMetadefIdGenerator__construct() = 0;
   virtual void ModelMetadefIdGenerator__operator_delete(ModelMetadefIdGenerator* p) = 0;
   virtual int ModelMetadefIdGenerator__GenerateId(const ModelMetadefIdGenerator* p, const GraphViewer& graph_viewer, HashValue& model_hash) = 0;
+
+  // Float8E8M0 support — appended at end to preserve vtable ABI compatibility
+#if !defined(DISABLE_FLOAT8_TYPES)
+  virtual MLDataType DataTypeImpl__GetType_Float8E8M0() = 0;
+  virtual MLDataType DataTypeImpl__GetTensorType_Float8E8M0() = 0;
+#if !defined(DISABLE_SPARSE_TENSORS)
+  virtual MLDataType DataTypeImpl__GetSparseTensorType_Float8E8M0() = 0;
+#endif
+  virtual Float8E8M0* Tensor__MutableData_Float8E8M0(Tensor* p) = 0;
+  virtual const Float8E8M0* Tensor__Data_Float8E8M0(const Tensor* p) = 0;
+  virtual bool Tensor__IsDataType_Float8E8M0(const Tensor* p) noexcept = 0;
+#endif
 };
 
 #if defined(_MSC_VER) && !defined(__clang__)

@@ -19,7 +19,8 @@ template <typename T, cudnnReduceTensorIndices_t ReduceTensorIndices = CUDNN_RED
 std::unique_ptr<Tensor> ReduceCompute(const AllocatorPtr& gpu_allocator, cudnnReduceTensorOp_t cudnn_reduce_op, AllocatorPtr allocator,
                                       const Tensor& input, gsl::span<const int64_t> axes,
                                       bool keep_dims, bool calculate_log, bool calculate_sqt, bool log_sum_exp,
-                                      bool fast_reduction, Stream* stream, const TensorShape* input_shape_override = nullptr);
+                                      bool fast_reduction, Stream* stream, cudnnHandle_t cudnn_handle,
+                                      const TensorShape* input_shape_override = nullptr);
 
 }  // namespace ReductionOps
 
@@ -46,9 +47,7 @@ class ReduceKernel : public CudaKernel, public ReduceKernelBase<allow_multi_axes
         calculate_log_(false),
         calculate_sqt_(false),
         log_sum_exp_(false),
-        fast_reduction_(false) {
-    cuda_ep_ = static_cast<const CUDAExecutionProvider*>(info.GetExecutionProvider());
-  }
+        fast_reduction_(false) {}
 
   // Only Max Min need to set ReduceTensorIndices CUDNN_REDUCE_TENSOR_FLATTENED_INDICES as per cudnn library manual
   // Only Max Min will have indices output, need to set the indices to nullptr for other ops
@@ -80,15 +79,20 @@ class ReduceKernel : public CudaKernel, public ReduceKernelBase<allow_multi_axes
   // Indicates if this reduction can be delegated to our highly-optimized reduction kernels.
   // Those efficient kernels are defined/implemented in reduction_functions.h/.cu.
   bool fast_reduction_;
-
-  // We need to access to the CUDA EP instance to get the cudnn handle
-  const CUDAExecutionProvider* cuda_ep_;
 };
 
 template <typename T>
 class ArgMax final : public ReduceKernel<false> {
  public:
-  ArgMax(const OpKernelInfo& info) : ReduceKernel<false>(info) {}
+  ArgMax(const OpKernelInfo& info) : ReduceKernel<false>(info) {
+    // The following is just a safety check.
+    // The logic in ArgMaxOrArgMinNeedFallbackToCPU() makes sure to not assign ArgMax
+    // nodes with select_last_index == 1 to the CUDA EP.
+    int64_t select_last_index = 0;
+    if (info.GetAttr<int64_t>("select_last_index", &select_last_index).IsOK()) {
+      ORT_ENFORCE(select_last_index == 0, "select_last_index as 1 is not supported on CUDA");
+    }
+  }
 
   Status ComputeInternal(OpKernelContext* ctx) const override {
     return ComputeImpl<T, CUDNN_REDUCE_TENSOR_FLATTENED_INDICES>(ctx, CUDNN_REDUCE_TENSOR_MAX);
@@ -98,7 +102,15 @@ class ArgMax final : public ReduceKernel<false> {
 template <typename T>
 class ArgMin final : public ReduceKernel<false> {
  public:
-  ArgMin(const OpKernelInfo& info) : ReduceKernel<false>(info) {}
+  ArgMin(const OpKernelInfo& info) : ReduceKernel<false>(info) {
+    // The following is just a safety check.
+    // The logic in ArgMaxOrArgMinNeedFallbackToCPU() makes sure to not assign ArgMin
+    // nodes with select_last_index == 1 to the CUDA EP.
+    int64_t select_last_index = 0;
+    if (info.GetAttr<int64_t>("select_last_index", &select_last_index).IsOK()) {
+      ORT_ENFORCE(select_last_index == 0, "select_last_index as 1 is not supported on CUDA");
+    }
+  }
 
   Status ComputeInternal(OpKernelContext* ctx) const override {
     return ComputeImpl<T, CUDNN_REDUCE_TENSOR_FLATTENED_INDICES>(ctx, CUDNN_REDUCE_TENSOR_MIN);
@@ -224,11 +236,11 @@ Status PrepareForReduce(const Tensor* X,
                         const TensorShape* input_shape_override = nullptr);
 
 template <typename T, cudnnReduceTensorIndices_t ReduceTensorIndices>
-Status ReduceComputeCore(const AllocatorPtr& allocator, const Tensor& input, PrepareReduceMetadata& prepare_reduce_metadata,
+Status ReduceComputeCore(const AllocatorPtr& allocator, const CudaKernel* kernel, const Tensor& input, PrepareReduceMetadata& prepare_reduce_metadata,
                          /*out*/ Tensor& output, cudnnReduceTensorOp_t cudnn_reduce_op,
                          gsl::span<const int64_t> axes,
                          bool calculate_log, bool calculate_sqt, bool log_sum_exp, bool fast_reduction,
-                         Stream* ort_stream,
+                         cudaStream_t cuda_stream, void* compute_stream, cudnnHandle_t cudnn_handle,
                          const TensorShape* input_shape_override = nullptr);
 
 // CUDA's reduction descriptor cudnnReduceTensorDescriptor_t is a pointer so

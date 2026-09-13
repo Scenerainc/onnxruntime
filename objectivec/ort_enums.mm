@@ -55,6 +55,7 @@ constexpr TensorElementTypeInfo kElementTypeInfos[]{
     {ORTTensorElementDataTypeInt64, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, sizeof(int64_t)},
     {ORTTensorElementDataTypeUInt64, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64, sizeof(uint64_t)},
     {ORTTensorElementDataTypeString, ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING, std::nullopt},
+    {ORTTensorElementDataTypeBool, ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL, sizeof(bool)},
 };
 
 struct GraphOptimizationLevelInfo {
@@ -68,6 +69,7 @@ constexpr GraphOptimizationLevelInfo kGraphOptimizationLevelInfos[]{
     {ORTGraphOptimizationLevelNone, ORT_DISABLE_ALL},
     {ORTGraphOptimizationLevelBasic, ORT_ENABLE_BASIC},
     {ORTGraphOptimizationLevelExtended, ORT_ENABLE_EXTENDED},
+    {ORTGraphOptimizationLevelLayout, ORT_ENABLE_LAYOUT},
     {ORTGraphOptimizationLevelAll, ORT_ENABLE_ALL},
 };
 

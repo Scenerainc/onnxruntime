@@ -831,7 +831,6 @@ def test_gradient_correctness_conv1d(use_fp16, input_requires_grad, conv_algo_se
         ort_model._is_training()
     )._execution_agent._inference_session._provider_options
 
-    # cudnn_conv_algo_search is for CUDA only, so setting the system env will not affect the compute on ROCm.
     if "CUDAExecutionProvider" in provider_options:
         expected_conv_algo_search = "HEURISTIC" if conv_algo_search is None else conv_algo_search
         actual_conv_algo_search = provider_options["CUDAExecutionProvider"]["cudnn_conv_algo_search"]
@@ -3320,8 +3319,8 @@ def test_parameters():
     N, D_in, H, D_out = 64, 784, 500, 10  # noqa: F841, N806
     pt_model = NeuralNetSinglePositionalArgument(D_in, H, D_out).to(device)
     ort_model = ORTModule(copy.deepcopy(pt_model))
-    parameters_pt = [param for param in pt_model.parameters()]
-    parameters_ort = [param for param in ort_model.parameters()]
+    parameters_pt = list(pt_model.parameters())
+    parameters_ort = list(ort_model.parameters())
 
     assert len(parameters_pt) > 0
     assert len(parameters_pt) == len(parameters_ort)
@@ -3351,8 +3350,8 @@ def test_buffers():
     pt_model = NeuralNetSinglePositionalArgument(D_in, H, D_out).to(device)
     pt_model.register_buffer("sample_buffer_pt", torch.tensor(torch.randn(N, D_in, device=device)))
     ort_model = ORTModule(copy.deepcopy(pt_model))
-    buffers_pt = [buffer for buffer in pt_model.buffers()]
-    buffers_ort = [buffer for buffer in ort_model.buffers()]
+    buffers_pt = list(pt_model.buffers())
+    buffers_ort = list(ort_model.buffers())
 
     assert len(buffers_pt) > 0
     assert len(buffers_pt) == len(buffers_ort)
@@ -3360,7 +3359,7 @@ def test_buffers():
 
     x = torch.tensor(torch.randn(N, D_in, device=device))
     ort_model.register_buffer("sample_buffer_ort", x)
-    buffers_ort = [buffer for buffer in ort_model.buffers()]
+    buffers_ort = list(ort_model.buffers())
     assert len(buffers_ort) == 2
     assert torch.equal(buffers_ort[1], x)
 
@@ -4166,7 +4165,7 @@ def test_output_order():
     out_ort = ort_model(*y)
 
     assert len(out_pt) == len(out_ort)
-    for x, y in zip(out_pt, out_ort):
+    for x, y in zip(out_pt, out_ort, strict=False):
         _test_helpers.assert_values_are_close(x, y)
 
 
@@ -4257,7 +4256,7 @@ def test_hf_save_pretrained():
         ).to(device)
         model2 = ORTModule(model2)
 
-        for p1, p2 in zip(model1.parameters(), model2.parameters()):
+        for p1, p2 in zip(model1.parameters(), model2.parameters(), strict=False):
             assert p1.data.ne(p2.data).sum() == 0
 
 
@@ -5123,7 +5122,7 @@ def test_ortmodule_fused_adam_optimizer_correctness():
         pt_loss = run_step(pt_model, x1)
         ort_loss = run_step(ort_model, x2)
 
-        for pt_param, ort_param in zip(pt_model.parameters(), ort_model.parameters()):
+        for pt_param, ort_param in zip(pt_model.parameters(), ort_model.parameters(), strict=False):
             ort_param.grad = copy.deepcopy(pt_param.grad)
 
         _test_helpers.assert_values_are_close(pt_loss, ort_loss)
@@ -5133,7 +5132,7 @@ def test_ortmodule_fused_adam_optimizer_correctness():
             run_optim_step(transformers_adamw_optimizer)
             run_optim_step(ort_fused_adam_optimizer)
 
-        for pt_param, ort_param in zip(pt_model.parameters(), ort_model.parameters()):
+        for pt_param, ort_param in zip(pt_model.parameters(), ort_model.parameters(), strict=False):
             _test_helpers.assert_values_are_close(pt_param, ort_param, atol=1e-4, rtol=1e-5)
 
 
@@ -5173,7 +5172,7 @@ def test_ortmodule_fused_adam_optimizer_correctness_torch():
         pt_loss = run_step(pt_model, x1)
         ort_loss = run_step(ort_model, x2)
 
-        for pt_param, ort_param in zip(pt_model.parameters(), ort_model.parameters()):
+        for pt_param, ort_param in zip(pt_model.parameters(), ort_model.parameters(), strict=False):
             ort_param.grad = copy.deepcopy(pt_param.grad)
 
         _test_helpers.assert_values_are_close(pt_loss, ort_loss, atol=1e-4, rtol=1e-5)
@@ -5185,7 +5184,7 @@ def test_ortmodule_fused_adam_optimizer_correctness_torch():
             run_optim_step(adamw_optimizer)
             run_optim_step(ort_fused_adam_optimizer)
 
-        for pt_param, ort_param in zip(pt_model.parameters(), ort_model.parameters()):
+        for pt_param, ort_param in zip(pt_model.parameters(), ort_model.parameters(), strict=False):
             _test_helpers.assert_values_are_close(pt_param, ort_param, atol=1e-4, rtol=1e-5)
 
 
@@ -5506,7 +5505,7 @@ def test_random_states_unchanged_for_ortmodule():
         assert type(a) is type(b)
         if isinstance(a, tuple):
             assert len(a) == len(b)
-            return all([random_state_equal(a_i, b_i) for a_i, b_i in zip(a, b)])
+            return all(random_state_equal(a_i, b_i) for a_i, b_i in zip(a, b, strict=False))
         if isinstance(a, np.ndarray):
             return np.array_equal(a, b)
         if isinstance(a, torch.Tensor):
@@ -5776,7 +5775,7 @@ def test_runtime_inspector_label_and_embed_sparsity_detection(embed_is_sparse, l
     device = "cuda"
     num_embeddings, embedding_dim = 16, 128
     pt_model = NeuralNetCrossEntropyLoss(num_embeddings, embedding_dim).to(device)
-    from onnxruntime.training.ortmodule import DebugOptions, LogLevel
+    from onnxruntime.training.ortmodule import DebugOptions, LogLevel  # noqa: PLC0415
 
     ort_model = ORTModule(pt_model, DebugOptions(log_level=LogLevel.INFO))
 
@@ -6064,7 +6063,7 @@ def test_e2e_padding_elimination():
             self.dropout2 = nn.Dropout(0.0)
 
         def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
-            new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+            new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)  # noqa: RUF005
             x = x.view(new_x_shape)
             return x.permute(0, 2, 1, 3)
 
@@ -6079,7 +6078,7 @@ def test_e2e_padding_elimination():
             attention_probs = self.dropout1(attention_probs)
             context_layer = torch.matmul(attention_probs, value_layer)
             context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-            new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+            new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)  # noqa: RUF005
             context_layer = context_layer.view(new_context_layer_shape)
 
             output = self.dense(context_layer)
@@ -6170,14 +6169,10 @@ def test_e2e_padding_elimination():
         run_optim_step(pt_optimizer)
         run_optim_step(ort_optimizer)
 
-        for pt_param, ort_param in zip(pt_model.parameters(), ort_model.parameters()):
+        for pt_param, ort_param in zip(pt_model.parameters(), ort_model.parameters(), strict=False):
             _test_helpers.assert_values_are_close(pt_param.grad, ort_param.grad, atol=1e-4, rtol=1e-5)
 
-        if os.getenv("ORTMODULE_ROCM_TEST", "0") == "1":
-            # For ROCm EP, the difference between ORT and PyTorch is larger than CUDA EP.
-            _test_helpers.assert_values_are_close(ort_prediction, pt_prediction, atol=2e-3, rtol=2e-4)
-        else:
-            _test_helpers.assert_values_are_close(ort_prediction, pt_prediction, atol=1e-3, rtol=1e-4)
+        _test_helpers.assert_values_are_close(ort_prediction, pt_prediction, atol=1e-3, rtol=1e-4)
 
     training_model = ort_model._torch_module._execution_manager(True)._onnx_models.optimized_model
     assert "FlattenAndUnpad" in [node.op_type for node in training_model.graph.node]
@@ -6332,9 +6327,6 @@ def test_leakyrelu_gradient():
     _test_helpers.assert_values_are_close(pt_x.grad, ort_x.grad)
 
 
-@pytest.mark.skipif(
-    os.getenv("ORTMODULE_ROCM_TEST", "0") == "1", reason="Skip for ROCm because the kernel is not implemented for ROCm"
-)
 @pytest.mark.parametrize("use_fp16", [False, True])
 @pytest.mark.parametrize("conv_algo_search", [None, "EXHAUSTIVE", "HEURISTIC"])
 def test_conv_transpose_gradient(use_fp16, conv_algo_search):
@@ -6394,7 +6386,7 @@ def test_conv_transpose_gradient(use_fp16, conv_algo_search):
     pt_grads = run_step(pt_model, pt_x)
     ort_grads = run_step(ort_model, ort_x)
 
-    for pt_grad, ort_grad in zip(pt_grads, ort_grads):
+    for pt_grad, ort_grad in zip(pt_grads, ort_grads, strict=False):
         if use_fp16:
             assert torch.allclose(pt_grad, ort_grad, atol=1e-3, rtol=1e-3)
         else:
@@ -6404,9 +6396,6 @@ def test_conv_transpose_gradient(use_fp16, conv_algo_search):
         del os.environ["ORTMODULE_CONV_ALGO_SEARCH"]
 
 
-@pytest.mark.skipif(
-    os.getenv("ORTMODULE_ROCM_TEST", "0") == "1", reason="Skip for ROCm because the kernel is not implemented for ROCm"
-)
 @pytest.mark.parametrize("conv_algo_search", [None, "EXHAUSTIVE", "HEURISTIC"])
 def test_conv_transpose_gradient_with_groups(conv_algo_search):
     class TransposedConv3DWithGroups(nn.Module):
@@ -6443,16 +6432,13 @@ def test_conv_transpose_gradient_with_groups(conv_algo_search):
     pt_grads = run_step(pt_model, pt_x)
     ort_grads = run_step(ort_model, ort_x)
 
-    for pt_grad, ort_grad in zip(pt_grads, ort_grads):
+    for pt_grad, ort_grad in zip(pt_grads, ort_grads, strict=False):
         assert torch.allclose(pt_grad, ort_grad)
 
     if conv_algo_search is not None:
         del os.environ["ORTMODULE_CONV_ALGO_SEARCH"]
 
 
-@pytest.mark.skipif(
-    os.getenv("ORTMODULE_ROCM_TEST", "0") == "1", reason="Skip for ROCm because the kernel is not implemented for ROCm"
-)
 @pytest.mark.parametrize("conv_algo_search", [None, "EXHAUSTIVE", "HEURISTIC"])
 def test_conv_transpose_gradient_with_strides_padding_and_dilation(conv_algo_search):
     class ConvTransposeComplexModel(nn.Module):
@@ -6489,7 +6475,7 @@ def test_conv_transpose_gradient_with_strides_padding_and_dilation(conv_algo_sea
     pt_grads = run_step(pt_model, pt_x)
     ort_grads = run_step(ort_model, ort_x)
 
-    for pt_grad, ort_grad in zip(pt_grads, ort_grads):
+    for pt_grad, ort_grad in zip(pt_grads, ort_grads, strict=False):
         assert torch.allclose(pt_grad, ort_grad, atol=1e-2, rtol=1e-2)
 
     if conv_algo_search is not None:
@@ -6525,7 +6511,7 @@ def test_bert_result_with_layerwise_recompute():
         _test_helpers.assert_gradients_match_and_reset_gradient(ort_model, ort_model_with_reompute)
 
     execution_mgr = ort_model_with_reompute._torch_module._execution_manager._training_manager
-    from onnxruntime.training.ortmodule._onnx_models import _get_onnx_file_name
+    from onnxruntime.training.ortmodule._onnx_models import _get_onnx_file_name  # noqa: PLC0415
 
     # Keep the logic aligned with _graph_execution_manager.py
     path = os.path.join(
@@ -6562,7 +6548,8 @@ def test_bert_memory_inspection(caplog):
     os.environ["ORTMODULE_PRINT_MEMORY_STATS"] = "1"
     pt_model.eval()  # Put it in evaluate mode by intention, in case some initialization in ORTModule use the module.is_training for its checks by mistake.
     ort_model = ORTModule(
-        copy.deepcopy(pt_model), DebugOptions(log_level=LogLevel.INFO)  # The logged memory info is in INFO level.
+        copy.deepcopy(pt_model),
+        DebugOptions(log_level=LogLevel.INFO),  # The logged memory info is in INFO level.
     )
 
     def run_step(model, x, y, z):
@@ -6623,7 +6610,7 @@ def test_overridden_softmax_export(softmax_compute_type):
 
     # Check the ONNX Softmax is running in float32.
     execution_mgr = ort_model._torch_module._execution_manager._training_manager
-    from onnxruntime.training.ortmodule._onnx_models import _get_onnx_file_name
+    from onnxruntime.training.ortmodule._onnx_models import _get_onnx_file_name  # noqa: PLC0415
 
     # Keep the logic aligned with _graph_execution_manager.py
     path = os.path.join(
@@ -6634,7 +6621,7 @@ def test_overridden_softmax_export(softmax_compute_type):
     )
 
     onnx_model = onnx.load(path)
-    onnx_nodes = [n for n in onnx_model.graph.node]
+    onnx_nodes = list(onnx_model.graph.node)
 
     assert onnx_nodes[0].op_type == "Cast"
     to_attr = onnx_nodes[0].attribute[0]
@@ -6643,8 +6630,6 @@ def test_overridden_softmax_export(softmax_compute_type):
     assert to_value == pytorch_type_to_onnx_dtype(softmax_compute_type), "Cast to attribute is not as expected"
 
 
-# TODO: fix the issue in rocm training, then enable the test.
-@pytest.mark.skip(reason="This test is disabled due to its breaking rocm training cis.")
 def test_aten_conv_bf16():
     class NeuralNetConv(torch.nn.Module):
         def __init__(self):
@@ -6695,7 +6680,7 @@ def test_enable_layerwise_recompute(memory_optimization_level, allow_gradient_ch
     """
     if fx == "deepspeed":
         try:
-            import deepspeed
+            import deepspeed  # noqa: PLC0415
 
             checkpoint = deepspeed.checkpointing.checkpoint
         except ImportError:
@@ -6703,7 +6688,7 @@ def test_enable_layerwise_recompute(memory_optimization_level, allow_gradient_ch
             return
 
     elif fx == "torch":
-        from torch.utils.checkpoint import checkpoint
+        from torch.utils.checkpoint import checkpoint  # noqa: PLC0415
     else:
         raise ValueError(f"unsupported fx value: {fx}. only torch and deepspeed are supported.")
 
@@ -6743,7 +6728,7 @@ def test_enable_layerwise_recompute(memory_optimization_level, allow_gradient_ch
     # Forward pass
 
     # Tolerant export failure.
-    import contextlib
+    import contextlib  # noqa: PLC0415
 
     with contextlib.suppress(Exception):
         _ = model(input)
@@ -6776,11 +6761,9 @@ def test_enable_layerwise_recompute(memory_optimization_level, allow_gradient_ch
 
 
 def test_layerwise_recompute_pythonop_deterministic():
-
     original_val = os.environ.get("ORTMODULE_MEMORY_OPT_LEVEL", None)
 
     class DropoutFunction(torch.autograd.Function):
-
         @staticmethod
         def forward(ctx, x):
             return torch.nn.functional.dropout(x, p=0.5, training=True)
@@ -6802,7 +6785,7 @@ def test_layerwise_recompute_pythonop_deterministic():
             self.LayerNorm = nn.LayerNorm(hidden_size, eps=1e-05)
 
         def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
-            new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+            new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)  # noqa: RUF005
             x = x.view(new_x_shape)
             return x.permute(0, 2, 1, 3)
 
@@ -6817,7 +6800,7 @@ def test_layerwise_recompute_pythonop_deterministic():
             attention_probs = DropoutFunction.apply(attention_probs)
             context_layer = torch.matmul(attention_probs, value_layer)
             context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-            new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+            new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)  # noqa: RUF005
             context_layer = context_layer.view(new_context_layer_shape)
 
             output = self.dense(context_layer)
@@ -6918,17 +6901,13 @@ def test_layerwise_recompute_pythonop_deterministic():
     ort_model2 = ORTModule(copy.deepcopy(pt_model), DebugOptions(save_onnx=True, onnx_prefix="recompute"))
     ort_prediction2 = run_step(ort_model2, ort_input, ort_mask, ort_target)
 
-    for ort_param1, ort_param2 in zip(ort_model1.parameters(), ort_model2.parameters()):
+    for ort_param1, ort_param2 in zip(ort_model1.parameters(), ort_model2.parameters(), strict=False):
         _test_helpers.assert_values_are_close(ort_param1.grad, ort_param2.grad, atol=1e-4, rtol=1e-5)
 
-    if os.getenv("ORTMODULE_ROCM_TEST", "0") == "1":
-        # For ROCm EP, the difference between ORT and PyTorch is larger than CUDA EP.
-        _test_helpers.assert_values_are_close(ort_prediction1, ort_prediction2, atol=2e-3, rtol=2e-4)
-    else:
-        _test_helpers.assert_values_are_close(ort_prediction1, ort_prediction2, atol=1e-3, rtol=1e-4)
+    _test_helpers.assert_values_are_close(ort_prediction1, ort_prediction2, atol=1e-3, rtol=1e-4)
 
     execution_mgr = ort_model2._torch_module._execution_manager._training_manager
-    from onnxruntime.training.ortmodule._onnx_models import _get_onnx_file_name
+    from onnxruntime.training.ortmodule._onnx_models import _get_onnx_file_name  # noqa: PLC0415
 
     # Keep the logic aligned with _graph_execution_manager.py
     path = os.path.join(
@@ -6964,7 +6943,7 @@ def test_layerwise_recompute_pythonop_deterministic():
 def test_aten_attention():
     pytest.skip("Temporarily disabled pending investigation.")
 
-    from torch.nn.attention import SDPBackend, sdpa_kernel
+    from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: PLC0415
 
     class _NeuralNetAttention(torch.nn.Module):
         def __init__(self):
@@ -7006,7 +6985,7 @@ def test_aten_attention():
     _test_helpers.assert_values_are_close(ort_input[2].grad, pt_input[2].grad)
 
     execution_mgr = ort_model._torch_module._execution_manager._training_manager
-    from onnxruntime.training.ortmodule._onnx_models import _get_onnx_file_name
+    from onnxruntime.training.ortmodule._onnx_models import _get_onnx_file_name  # noqa: PLC0415
 
     path = os.path.join(
         execution_mgr._debug_options.save_onnx_models.path,

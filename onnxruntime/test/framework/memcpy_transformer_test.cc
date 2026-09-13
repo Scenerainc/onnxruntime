@@ -8,10 +8,7 @@
 #include "core/graph/model.h"
 #include "default_providers.h"
 #include "gtest/gtest.h"
-#include "test_utils.h"
-#ifdef USE_CUDA
-#include "test/common/cuda_op_test_utils.h"
-#endif
+#include "test/unittest_util/framework_test_utils.h"
 #include "test/test_environment.h"
 #include "asserts.h"
 
@@ -74,12 +71,19 @@ void ExpectCopy(const onnxruntime::Node& source, const std::string copy_op,
   }
   EXPECT_TRUE(false) << "Copy node expected but not found";
 }
+
 #ifdef USE_CUDA
 
+static InlinedVector<gsl::not_null<const IExecutionProvider*>> GetNotNullProviderPtrs(
+    const ExecutionProviders& providers) {
+  InlinedVector<gsl::not_null<const IExecutionProvider*>> not_null_provider_ptrs{};
+  for (auto& provider_ptr : providers) {
+    not_null_provider_ptrs.emplace_back(provider_ptr.get());
+  }
+  return not_null_provider_ptrs;
+}
+
 TEST(TransformerTest, MemcpyTransformerTest) {
-#if defined(USE_CUDA) && defined(USE_DML)
-  SKIP_CUDA_TEST_WITH_DML;
-#endif
   std::unordered_map<std::string, int> domain_to_version;
   domain_to_version[kOnnxDomain] = 7;
   auto model = std::make_shared<onnxruntime::Model>("test", false, ModelMetaData(), PathString(),
@@ -112,15 +116,17 @@ TEST(TransformerTest, MemcpyTransformerTest) {
 
   KernelRegistryManager kernel_registry_manager;
   ExecutionProviders execution_providers;
-#if defined(USE_CUDA)
   ASSERT_STATUS_OK(execution_providers.Add(onnxruntime::kCudaExecutionProvider, DefaultCudaExecutionProvider()));
-#endif
   ASSERT_STATUS_OK(execution_providers.Add(onnxruntime::kCpuExecutionProvider,
                                            std::make_unique<CPUExecutionProvider>(CPUExecutionProviderInfo())));
   KernelRegistryManager test_registry_manager;
   ASSERT_STATUS_OK(test_registry_manager.RegisterKernels(execution_providers));
 
-  MemcpyTransformer transformer({onnxruntime::kCudaExecutionProvider}, test_registry_manager);
+  InlinedVector<gsl::not_null<const IExecutionProvider*>> providers;
+  for (auto& provider_ptr : execution_providers) {
+    providers.push_back(provider_ptr.get());
+  }
+  MemcpyTransformer transformer(GetNotNullProviderPtrs(execution_providers), test_registry_manager);
 
   bool modified = false;
   status = transformer.Apply(graph, modified, DefaultLoggingManager().DefaultLogger());
@@ -137,9 +143,6 @@ TEST(TransformerTest, MemcpyTransformerTest) {
 }
 
 TEST(TransformerTest, MemcpyTransformerTestCudaFirst) {
-#if defined(USE_CUDA) && defined(USE_DML)
-  SKIP_CUDA_TEST_WITH_DML;
-#endif
   std::unordered_map<std::string, int> domain_to_version;
   domain_to_version[kOnnxDomain] = 7;
   auto model = std::make_shared<onnxruntime::Model>("test", false, ModelMetaData(), PathString(),
@@ -172,15 +175,13 @@ TEST(TransformerTest, MemcpyTransformerTestCudaFirst) {
 
   KernelRegistryManager kernel_registry_manager;
   ExecutionProviders execution_providers;
-
   ASSERT_STATUS_OK(execution_providers.Add(onnxruntime::kCudaExecutionProvider, DefaultCudaExecutionProvider()));
-
   ASSERT_STATUS_OK(execution_providers.Add(onnxruntime::kCpuExecutionProvider,
                                            std::make_unique<CPUExecutionProvider>(CPUExecutionProviderInfo())));
   KernelRegistryManager test_registry_manager;
   ASSERT_STATUS_OK(test_registry_manager.RegisterKernels(execution_providers));
 
-  MemcpyTransformer transformer({onnxruntime::kCudaExecutionProvider}, test_registry_manager);
+  MemcpyTransformer transformer(GetNotNullProviderPtrs(execution_providers), test_registry_manager);
 
   bool modified = false;
   status = transformer.Apply(graph, modified, DefaultLoggingManager().DefaultLogger());
@@ -275,6 +276,8 @@ TEST(TransformerTest, TestInitializerDuplicationInSubgraph) {
   if_node.AddAttribute("then_branch", subgraph.ToGraphProto());
   if_node.AddAttribute("else_branch", subgraph.ToGraphProto());
 
+  if_node.SetExecutionProviderType(onnxruntime::kCpuExecutionProvider);
+
   onnxruntime::Graph* subgraph_1 = if_node.GetMutableGraphAttribute("then_branch");
   for (auto& node : subgraph_1->Nodes()) {
     if (node.Name() == "node2") {
@@ -294,17 +297,13 @@ TEST(TransformerTest, TestInitializerDuplicationInSubgraph) {
 
   KernelRegistryManager kernel_registry_manager;
   ExecutionProviders execution_providers;
-#if defined(USE_CUDA) && defined(USE_DML)
-  SKIP_CUDA_TEST_WITH_DML;
-#endif
   ASSERT_STATUS_OK(execution_providers.Add(onnxruntime::kCudaExecutionProvider, DefaultCudaExecutionProvider()));
-
   ASSERT_STATUS_OK(execution_providers.Add(onnxruntime::kCpuExecutionProvider,
                                            std::make_unique<CPUExecutionProvider>(CPUExecutionProviderInfo())));
   KernelRegistryManager test_registry_manager;
   ASSERT_STATUS_OK(test_registry_manager.RegisterKernels(execution_providers));
 
-  MemcpyTransformer transformer({onnxruntime::kCudaExecutionProvider}, test_registry_manager);
+  MemcpyTransformer transformer(GetNotNullProviderPtrs(execution_providers), test_registry_manager);
 
   bool modified = false;
   ASSERT_STATUS_OK(transformer.Apply(graph, modified, DefaultLoggingManager().DefaultLogger()));
@@ -340,17 +339,13 @@ TEST(TransformerTest, MemcpyTransformerTestGraphInputConsumedOnMultipleDevices) 
 
   KernelRegistryManager kernel_registry_manager;
   ExecutionProviders execution_providers;
-#if defined(USE_CUDA) && defined(USE_DML)
-  SKIP_CUDA_TEST_WITH_DML;
-#endif
   ASSERT_STATUS_OK(execution_providers.Add(onnxruntime::kCudaExecutionProvider, DefaultCudaExecutionProvider()));
-
   ASSERT_STATUS_OK(execution_providers.Add(onnxruntime::kCpuExecutionProvider,
                                            std::make_unique<CPUExecutionProvider>(CPUExecutionProviderInfo())));
   KernelRegistryManager test_registry_manager;
   ASSERT_STATUS_OK(test_registry_manager.RegisterKernels(execution_providers));
 
-  MemcpyTransformer transformer({onnxruntime::kCudaExecutionProvider}, test_registry_manager);
+  MemcpyTransformer transformer(GetNotNullProviderPtrs(execution_providers), test_registry_manager);
 
   bool modified = false;
   status = transformer.Apply(graph, modified, DefaultLoggingManager().DefaultLogger());
@@ -419,6 +414,8 @@ TEST(TransformerTest, MemcpyTransformerTestImplicitInputConsumedOnMultipleDevice
   if_node.AddAttribute("then_branch", subgraph.ToGraphProto());
   if_node.AddAttribute("else_branch", subgraph.ToGraphProto());
 
+  if_node.SetExecutionProviderType(onnxruntime::kCpuExecutionProvider);
+
   graph.SetInputs({&i1_def, &i2_def});
 
   onnxruntime::Graph* subgraph_1 = if_node.GetMutableGraphAttribute("then_branch");
@@ -446,17 +443,13 @@ TEST(TransformerTest, MemcpyTransformerTestImplicitInputConsumedOnMultipleDevice
 
   KernelRegistryManager kernel_registry_manager;
   ExecutionProviders execution_providers;
-#if defined(USE_CUDA) && defined(USE_DML)
-  SKIP_CUDA_TEST_WITH_DML;
-#endif
   ASSERT_STATUS_OK(execution_providers.Add(onnxruntime::kCudaExecutionProvider, DefaultCudaExecutionProvider()));
-
   ASSERT_STATUS_OK(execution_providers.Add(onnxruntime::kCpuExecutionProvider,
                                            std::make_unique<CPUExecutionProvider>(CPUExecutionProviderInfo())));
   KernelRegistryManager test_registry_manager;
   ASSERT_STATUS_OK(test_registry_manager.RegisterKernels(execution_providers));
 
-  MemcpyTransformer transformer({onnxruntime::kCudaExecutionProvider}, test_registry_manager);
+  MemcpyTransformer transformer(GetNotNullProviderPtrs(execution_providers), test_registry_manager);
 
   bool modified = false;
   status = transformer.Apply(graph, modified, DefaultLoggingManager().DefaultLogger());

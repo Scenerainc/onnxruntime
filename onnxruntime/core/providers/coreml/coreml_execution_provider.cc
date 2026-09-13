@@ -11,6 +11,7 @@
 #include "core/framework/tensorprotoutils.h"
 #include "core/graph/graph_viewer.h"
 #include "core/providers/coreml/builders/helper.h"
+#include "core/providers/coreml/builders/op_builder_factory.h"
 #include "core/providers/partitioning_utils.h"
 #include "core/session/onnxruntime_cxx_api.h"
 
@@ -18,81 +19,102 @@
 #include "core/providers/coreml/model/host_utils.h"
 #include "core/providers/coreml/model/model.h"
 #include "core/providers/coreml/shape_utils.h"
+#include "core/graph/model.h"
 
 namespace onnxruntime {
 
 constexpr const char* COREML = "CoreML";
 
-CoreMLExecutionProvider::CoreMLExecutionProvider(uint32_t coreml_flags)
+CoreMLExecutionProvider::CoreMLExecutionProvider(const CoreMLOptions& options)
     : IExecutionProvider{onnxruntime::kCoreMLExecutionProvider},
-      coreml_flags_(coreml_flags),
+      coreml_options_(options),
       coreml_version_(coreml::util::CoreMLVersion()) {
   LOGS_DEFAULT(VERBOSE) << "CoreML version: " << coreml_version_;
   if (coreml_version_ < MINIMUM_COREML_VERSION) {
-    LOGS_DEFAULT(ERROR) << "CoreML EP is not supported on this platform.";
+    ORT_THROW("CoreML EP is not supported on this platform.");
   }
-
-  // check if only one flag is set
-  if ((coreml_flags & COREML_FLAG_USE_CPU_ONLY) && (coreml_flags & COREML_FLAG_USE_CPU_AND_GPU)) {
-    // multiple device options selected
-    ORT_THROW(
-        "Multiple device options selected, you should use at most one of the following options:"
-        "COREML_FLAG_USE_CPU_ONLY or COREML_FLAG_USE_CPU_AND_GPU or not set");
-  }
-
-#if defined(COREML_ENABLE_MLPROGRAM)
-  if (coreml_version_ < MINIMUM_COREML_MLPROGRAM_VERSION &&
-      (coreml_flags_ & COREML_FLAG_CREATE_MLPROGRAM) != 0) {
-    LOGS_DEFAULT(WARNING) << "ML Program is not supported on this OS version. Falling back to NeuralNetwork.";
-    coreml_flags_ ^= COREML_FLAG_CREATE_MLPROGRAM;
-  }
-#else
-  if ((coreml_flags_ & COREML_FLAG_CREATE_MLPROGRAM) != 0) {
-    LOGS_DEFAULT(WARNING) << "ML Program is not supported in this build. Falling back to NeuralNetwork.";
-    coreml_flags_ ^= COREML_FLAG_CREATE_MLPROGRAM;
-  }
-#endif
 }
 
 CoreMLExecutionProvider::~CoreMLExecutionProvider() {}
 
 std::vector<std::unique_ptr<ComputeCapability>>
 CoreMLExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_viewer,
-                                       const IKernelLookup& /*kernel_lookup*/) const {
+                                       const IKernelLookup& /*kernel_lookup*/,
+                                       const GraphOptimizerRegistry& /* graph_optimizer_registry */,
+                                       IResourceAccountant* /* resource_accountant */) const {
   std::vector<std::unique_ptr<ComputeCapability>> result;
-
-  if (coreml_version_ < MINIMUM_COREML_VERSION) {
-    return result;
-  }
 
   const auto& logger = *GetLogger();
 
   // We do not run CoreML EP on subgraph, instead we cover this in the control flow nodes
   // TODO investigate whether we want to support subgraph using CoreML EP. May simply require processing the
   // implicit inputs of the control flow node that contains the subgraph as inputs to the CoreML model we generate.
-  if (graph_viewer.IsSubgraph() && !(coreml_flags_ & COREML_FLAG_ENABLE_ON_SUBGRAPH)) {
+  if (graph_viewer.IsSubgraph() && !coreml_options_.EnableOnSubgraph()) {
     return result;
   }
 
-  const bool has_neural_engine = coreml::HasNeuralEngine(logger);
-  if ((coreml_flags_ & COREML_FLAG_ONLY_ENABLE_DEVICE_WITH_ANE) && !has_neural_engine) {
-    LOGS(logger, WARNING) << "The current system does not have Apple Neural Engine. CoreML EP will not be used.";
-    return result;
-  }
-
-  const auto builder_params = coreml::MakeOpBuilderParams(graph_viewer, coreml_version_, coreml_flags_);
+  const auto builder_params = coreml::MakeOpBuilderParams(graph_viewer, coreml_version_,
+                                                          coreml_options_.RequireStaticShape(), coreml_options_.CreateMLProgram());
   const auto supported_nodes = coreml::GetSupportedNodes(graph_viewer, builder_params, logger);
+  const Graph* main_graph = &graph_viewer.GetGraph();
+  while (main_graph->IsSubgraph()) {
+    main_graph = main_graph->ParentGraph();
+  }
+  const auto& metadata = main_graph->GetModel().MetaData();
 
+  std::string user_provided_key = metadata.count(kCOREML_CACHE_KEY) > 0
+                                      ? metadata.at(kCOREML_CACHE_KEY)
+                                      : "";
+  if (user_provided_key.size() > 64 ||
+      std::any_of(user_provided_key.begin(), user_provided_key.end(),
+                  [](unsigned char c) { return !std::isalnum(c); })) {
+    LOGS(logger, ERROR) << "[" << kCOREML_CACHE_KEY << ":" << user_provided_key << "] is not a valid cache key."
+                        << " It should be alphanumeric and less than 64 characters.";
+    user_provided_key = "";
+  }
   const auto gen_metadef_name =
       [&]() {
         HashValue model_hash;
         int metadef_id = metadef_id_generator_.GenerateId(graph_viewer, model_hash);
-        return MakeString(COREML, "_", model_hash, "_", metadef_id);
+        // use model_hash as the key if user doesn't provide one
+        if (user_provided_key.empty()) {
+          // user passed a empty string
+          // model_hash is a 64-bit hash value of model_path if model_path is not empty,
+          // otherwise it hashes the graph input names and all the node output names.
+          // it can't guarantee the uniqueness of the key, so user should manager the key for the best.
+          user_provided_key = std::to_string(model_hash);
+        }
+        // The string format is used by onnxruntime/core/providers/coreml/builders/model_builder.cc::GetModelOutputPath
+        // If the format changes, the function should be updated accordingly.
+        return MakeString(user_provided_key, "_", COREML, "_", model_hash, "_", metadef_id);
       };
 
-  result = utils::CreateSupportedPartitions(graph_viewer, supported_nodes, {},
+  // Drop CoreML partitions that consist entirely of trivial shape / cheap-elementwise ops.
+  // These ops can each be claimed individually but the CPU↔CoreML round-trip cost
+  // (~50-100us marshalling) outweighs the saving when the partition has no compute-heavy
+  // op to amortise it over. Per-op CoreML dispatch cost is ~10-14us on M3 Max even for
+  // trivial ops (Identity/Ceil/Tile etc.), and CPU runs them in <1us each.
+  //
+  // The "trivial" marker lives on each op builder's IOpBuilder::IsTrivial(node)
+  // override rather than as a hardcoded set here, so adding a new trivial op
+  // builder doesn't risk drifting from a list maintained at the EP level.
+  const auto& op_builders = coreml::GetOpBuilders();
+  const auto is_node_trivial = [&](const Node* node) -> bool {
+    auto it = op_builders.find(node->OpType());
+    return it != op_builders.end() && it->second->IsTrivial(*node);
+  };
+  const auto is_node_supported = [&](const Node& node) -> bool {
+    return supported_nodes.find(&node) != supported_nodes.end();
+  };
+  const auto on_group_closed = [&](const std::vector<const Node*>& group) -> bool {
+    // Keep the partition only if at least one node is non-trivial.
+    return std::any_of(group.begin(), group.end(),
+                       [&](const Node* node) { return !is_node_trivial(node); });
+  };
+
+  result = utils::CreateSupportedPartitions(graph_viewer, is_node_supported, on_group_closed,
                                             gen_metadef_name, COREML, kCoreMLExecutionProvider,
-                                            nullptr,
+                                            /*node_unit_map*/ nullptr,
                                             /*drop_constant_initializers*/ true);
 
   const auto num_of_partitions = result.size();
@@ -143,7 +165,7 @@ common::Status CoreMLExecutionProvider::Compile(const std::vector<FusedNodeAndGr
       std::vector<std::string> onnx_output_names = get_names(fused_node.OutputDefs());
 
       const onnxruntime::GraphViewer& graph_viewer(fused_node_and_graph.filtered_graph);
-      ORT_RETURN_IF_ERROR(coreml::ModelBuilder::Build(graph_viewer, *GetLogger(), coreml_version_, coreml_flags_,
+      ORT_RETURN_IF_ERROR(coreml::ModelBuilder::Build(graph_viewer, *GetLogger(), coreml_version_, coreml_options_,
                                                       std::move(onnx_input_names), std::move(onnx_output_names),
                                                       coreml_model));
     }

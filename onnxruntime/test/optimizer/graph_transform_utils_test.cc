@@ -3,12 +3,13 @@
 
 #include "core/common/inlined_containers.h"
 #include "core/graph/onnx_protobuf.h"
-#include "test/framework/test_utils.h"
+#include "test/unittest_util/framework_test_utils.h"
 #include "test/capturing_sink.h"
 #include "test/test_environment.h"
 #include "gtest/gtest.h"
 #include "core/optimizer/graph_transformer_utils.h"
 #include "core/session/inference_session.h"
+#include "core/session/onnxruntime_session_options_config_keys.h"
 
 using namespace ONNX_NAMESPACE;
 
@@ -36,9 +37,11 @@ TEST(GraphTransformerUtilsTests, TestGenerateGraphTransformers) {
   std::string l2_transformer = "ConvActivationFusion";
   InlinedHashSet<std::string> disabled = {l1_rule1, l1_transformer, l2_transformer};
   CPUExecutionProvider cpu_ep(CPUExecutionProviderInfo{});
+  const auto& logger = DefaultLoggingManager().DefaultLogger();
 
-  auto all_transformers = optimizer_utils::GenerateTransformers(TransformerLevel::Level1, {}, cpu_ep);
-  auto filtered_transformers = optimizer_utils::GenerateTransformers(TransformerLevel::Level1, {}, cpu_ep, disabled);
+  auto all_transformers = optimizer_utils::GenerateTransformers(TransformerLevel::Level1, {}, cpu_ep, logger);
+  auto filtered_transformers = optimizer_utils::GenerateTransformers(TransformerLevel::Level1, {}, cpu_ep, logger,
+                                                                     disabled);
 
   // check ConstantFolding transformer was removed
   ASSERT_TRUE(filtered_transformers.size() == all_transformers.size() - 1);
@@ -61,9 +64,37 @@ TEST(GraphTransformerUtilsTests, TestGenerateGraphTransformers) {
 
 #ifndef DISABLE_CONTRIB_OPS
   // check that ConvActivationFusion was removed
-  all_transformers = optimizer_utils::GenerateTransformers(TransformerLevel::Level2, {}, cpu_ep);
-  filtered_transformers = optimizer_utils::GenerateTransformers(TransformerLevel::Level2, {}, cpu_ep, disabled);
+  all_transformers = optimizer_utils::GenerateTransformers(TransformerLevel::Level2, {}, cpu_ep, logger);
+  filtered_transformers = optimizer_utils::GenerateTransformers(TransformerLevel::Level2, {}, cpu_ep, logger,
+                                                                disabled);
   ASSERT_TRUE(filtered_transformers.size() == all_transformers.size() - 1);
+#endif
+}
+
+TEST(GraphTransformerUtilsTests, TestDQMatMulNBitsFusionConfigWithContribGating) {
+  SessionOptions session_options;
+  const auto status = session_options.config_options.AddConfigEntry(
+      kOrtSessionOptionsEnableDQMatMulNBitsFusion, "1");
+  ASSERT_TRUE(status.IsOK()) << status.ErrorMessage();
+
+  CPUExecutionProvider cpu_ep(CPUExecutionProviderInfo{});
+  const auto& logger = DefaultLoggingManager().DefaultLogger();
+
+#if defined(DISABLE_CONTRIB_OPS)
+  EXPECT_ANY_THROW({
+    std::ignore = optimizer_utils::GenerateTransformers(
+        TransformerLevel::Level1, session_options, cpu_ep, logger);
+  });
+#else
+  auto transformers = optimizer_utils::GenerateTransformers(
+      TransformerLevel::Level1, session_options, cpu_ep, logger);
+
+  const bool has_dq_matmulnbits_fusion =
+      std::any_of(transformers.begin(), transformers.end(), [](const auto& transformer) {
+        return transformer && transformer->Name() == "DQMatMulNBitsFusion";
+      });
+
+  EXPECT_TRUE(has_dq_matmulnbits_fusion);
 #endif
 }
 }  // namespace test

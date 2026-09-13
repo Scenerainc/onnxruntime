@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <limits>
 
 #include "core/common/common.h"
 #include "core/common/safeint.h"
@@ -239,8 +240,8 @@ std::unique_ptr<IndexedSubGraph::MetaDef> FuseActivation(const NodeUnit& node_un
   def.attributes = node_unit.GetNode().GetAttributes();
 
   // use infinity as the default as that's what xnnpack uses if min/max are not set
-  float min = -INFINITY;
-  float max = INFINITY;
+  float min = -std::numeric_limits<float>::infinity();
+  float max = std::numeric_limits<float>::infinity();
 
   const auto& activation_type = activation.OpType();
   if (activation_type == "Clip") {
@@ -361,7 +362,7 @@ TensorQuantType GetTensorQuantType(const NodeUnit& node_unit, int32_t io_index,
       } else if (scales_dim == tensor_shape[0]) {
         // default 0 for zero-point if zero_dim == 0
         if (zero_tensor != nullptr) {
-          Initializer zp_val(*zero_tensor, node_unit.ModelPath());
+          Initializer zp_val(graph_viewer.GetGraph(), *zero_tensor, node_unit.ModelPath());
           auto zero_points = zp_val.DataAsSpan<int8_t>();
           for (size_t i = 0; i < zp_val.size(); i++) {
             if (zero_points[i] != 0) {

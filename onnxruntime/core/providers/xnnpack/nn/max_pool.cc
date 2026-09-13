@@ -3,6 +3,8 @@
 
 #include "max_pool.h"
 
+#include <limits>
+
 #include "core/graph/graph.h"
 #include "core/providers/utils.h"
 #include "core/providers/xnnpack/xnnpack_init.h"
@@ -55,7 +57,7 @@ bool MaxPool::IsOnnxNodeSupported(const NodeUnit& node_unit,
     // input of maxpool could be fp16/fp32/fp64,i8/u8 according to ONNX
     if (x_type == nullptr ||
         (x_type->tensor_type().elem_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
-// because pool_fp16_op_test can be enabled by other preprocessor, for example, COREML_ENABLE_MLPROGRAM
+// because pool_fp16_op_test can be enabled by other preprocessor, for example, USE_COREML
 #ifdef XNNPACK_FP16_SUPPORTED
          x_type->tensor_type().elem_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16 &&
 #endif
@@ -113,17 +115,17 @@ bool MaxPool::IsOnnxNodeSupported(const NodeUnit& node_unit,
 MaxPool::MaxPool(const OpKernelInfo& info)
     : XnnpackKernel(info),
       pool_attrs_{info, "MaxPool", info.node().SinceVersion()} {
-  uint32_t input_padding_top = gsl::narrow<uint32_t>(pool_attrs_.pads[0]);
-  uint32_t input_padding_left = gsl::narrow<uint32_t>(pool_attrs_.pads[1]);
-  uint32_t input_padding_bottom = gsl::narrow<uint32_t>(pool_attrs_.pads[2]);
-  uint32_t input_padding_right = gsl::narrow<uint32_t>(pool_attrs_.pads[3]);
+  uint32_t input_padding_top = narrow<uint32_t>(pool_attrs_.pads[0]);
+  uint32_t input_padding_left = narrow<uint32_t>(pool_attrs_.pads[1]);
+  uint32_t input_padding_bottom = narrow<uint32_t>(pool_attrs_.pads[2]);
+  uint32_t input_padding_right = narrow<uint32_t>(pool_attrs_.pads[3]);
 
-  uint32_t pooling_height = gsl::narrow<uint32_t>(pool_attrs_.kernel_shape[0]);
-  uint32_t pooling_width = gsl::narrow<uint32_t>(pool_attrs_.kernel_shape[1]);
-  uint32_t stride_height = gsl::narrow<uint32_t>(pool_attrs_.strides[0]);
-  uint32_t stride_width = gsl::narrow<uint32_t>(pool_attrs_.strides[1]);
-  uint32_t dilation_height = gsl::narrow<uint32_t>(pool_attrs_.dilations[0]);
-  uint32_t dilation_width = gsl::narrow<uint32_t>(pool_attrs_.dilations[1]);
+  uint32_t pooling_height = narrow<uint32_t>(pool_attrs_.kernel_shape[0]);
+  uint32_t pooling_width = narrow<uint32_t>(pool_attrs_.kernel_shape[1]);
+  uint32_t stride_height = narrow<uint32_t>(pool_attrs_.strides[0]);
+  uint32_t stride_width = narrow<uint32_t>(pool_attrs_.strides[1]);
+  uint32_t dilation_height = narrow<uint32_t>(pool_attrs_.dilations[0]);
+  uint32_t dilation_width = narrow<uint32_t>(pool_attrs_.dilations[1]);
 
   // get values from any fusion with an activation
   if (std::string activation; info.GetAttr<std::string>("activation", &activation).IsOK()) {
@@ -168,8 +170,8 @@ MaxPool::MaxPool(const OpKernelInfo& info)
   auto input_dtype = X_arg.TypeAsProto()->tensor_type().elem_type();
   xnn_status status = xnn_status_invalid_state;
   struct xnn_operator* p = nullptr;
-  float foutput_min = clip_min_max_ ? clip_min_max_->first : -INFINITY;
-  float foutput_max = clip_min_max_ ? clip_min_max_->second : INFINITY;
+  float foutput_min = clip_min_max_ ? clip_min_max_->first : -std::numeric_limits<float>::infinity();
+  float foutput_max = clip_min_max_ ? clip_min_max_->second : std::numeric_limits<float>::infinity();
   if (input_dtype == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
     maxpool_type_ = OpComputeType::op_compute_type_fp32;
     status = xnn_create_max_pooling2d_nhwc_f32(input_padding_top, input_padding_right,

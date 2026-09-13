@@ -99,7 +99,6 @@ Status QOrderedAttention::PutIntoMergedBias(const Tensor& tensor, AllocatorPtr a
 }
 
 Status QOrderedAttention::PrePack(const Tensor& tensor, int input_idx, /*out*/ AllocatorPtr alloc,
-                                  bool /*save_prepacked_initializers*/,
                                   /*out*/ bool& is_packed,
                                   /*out*/ PrePackedWeights* /*prepacked_weights*/) {
   is_packed = false;
@@ -229,7 +228,7 @@ Status QOrderedAttention::ComputeInternal(OpKernelContext* context) const {
   output_shape[2] = static_cast<int64_t>(hidden_size);
   Tensor* output = context->Output(0, output_shape);
 
-  cublasLtHandle_t cublasLt = CublasLtHandle();
+  cublasLtHandle_t cublasLt = this->GetCublasLtHandle(context);
   // Use GEMM for fully connection.
   int m = batch_size * sequence_length;
   int n = 3 * hidden_size;
@@ -237,7 +236,7 @@ Status QOrderedAttention::ComputeInternal(OpKernelContext* context) const {
   int64_t size_of_attention_scores = ((int64_t)batch_size) * num_heads_ * sequence_length * sequence_length;
 
   // transposed qkv_layer,  union(stacked, attention probs + attention scores)
-  auto gemm_buffer_quantized = GetScratchBuffer<int8_t>((int64_t)m * n + std::max((int64_t)m * n, 2 * size_of_attention_scores), context->GetComputeStream());
+  auto gemm_buffer_quantized = GetScratchBuffer<int8_t>((int64_t)m * n + std::max((int64_t)m * n, 2 * size_of_attention_scores), GetComputeStream(context));
 
   int8_t* stacked_qkv_layers = gemm_buffer_quantized.get() + ((int64_t)m * n);
   int8_t* tranposed_qkv_layers = gemm_buffer_quantized.get();

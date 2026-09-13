@@ -4,6 +4,11 @@
 #pragma once
 #include <gsl/gsl>
 
+#include <algorithm>
+#include <cctype>
+#include <string>
+#include "core/common/common.h"
+
 namespace onnxruntime {
 namespace contrib {
 
@@ -32,7 +37,6 @@ enum AttentionQkvFormat {
   Q_K_V_BNSH,            // for non-packed qkv, permuted
   Q_K_V_BSNH,            // for non-packed qkv, not permuted, used by memory efficient attention or MultiHeadAttention
   Q_K_V_BSNH_BNSH_BNSH,  // for cross attention, k and v are permuted
-  Q_K_V_BNSH_QKV_BS3NH,  // for TRT fused causal attention, data has two formats (qkv is 3BNSH, gemm_buffer is BS3NH)
   Q_K_V_TNH,             // for memory efficient attention, qkv are not packed, and paddings are removed.
   Q_KV_BSNH_BSN2H,       // for TRT fused cross attention, kv are packed
   QKV_BSN3H,             // for TRT fused attention, qkv are packed
@@ -49,154 +53,135 @@ enum AttentionKernelType {
   AttentionKernel_FlashAttention,
   AttentionKernel_CudnnFlashAttention,
   AttentionKernel_LeanAttention,
+  AttentionKernel_DecoderAttention,
   AttentionKernel_Default
 };
 
-// Parameters deduced from node attributes and inputs/outputs.
-struct AttentionParameters {
-  int batch_size;
-  int sequence_length;
-  int kv_sequence_length;     // input sequence length of K or V
-  int past_sequence_length;   // sequence length in past state of K or V
-  int total_sequence_length;  // total sequence length of K or V
-  int max_sequence_length;    // max sequence length from 4D mask
-  int input_hidden_size;      // first dimension of weights for input projection
-  int hidden_size;            // hidden size of Q or K
-  int head_size;              // hidden size per head of Q or K
-  int v_hidden_size;          // hidden size of V
-  int v_head_size;            // hidden size per head of V
-  int num_heads;
-  int rotary_embedding;
-  bool is_unidirectional;
-  bool past_present_share_buffer;
-  bool do_rotary;
-  bool broadcast_attn_bias_dim_0;
-  bool broadcast_attn_bias_dim_1;
-  float mask_filter_value;
-  float scale;
-  bool use_tf32;
-  AttentionMaskType mask_type;
-  AttentionQkvFormat qkv_format;
+enum class QKOutputType : int {
+  NO_OUTPUT = 0,
+  BEFORE_SOFTMAX = 1,
+  AFTER_SOFTMAX = 2
 };
 
-struct DecoderMaskedMultiHeadAttentionParams : AttentionParameters {
-  int beam_width = 1;
-
-  // Only NeoX style rotary embedding is supported
-  int rotary_embedding_dim = 0;
-  int t_step = 0;
-
-  // Whether to use multihead attention(excludes matmul and bias)
-  bool is_mha = false;
-  bool is_cross_attention = false;
-  bool is_packed_qkv = false;
-
-  // Useful to better use global memory bandwidth on certain CUDA architectures.
-  // Turned off by default for now until we fully understand performance implications
-  // for all types of workloads.
-  // Can be turned on by appropriate environment variable (see attention_common.h).
-  bool kv_data_in_flight = false;
-
-  void* q = nullptr;
-  void* q_bias = nullptr;
-
-  void* k = nullptr;
-  void* k_bias = nullptr;
-
-  void* v = nullptr;
-  void* v_bias = nullptr;
-
-  void* attention_bias = nullptr;
-
-  void* k_cache = nullptr;
-  void* v_cache = nullptr;
-
-  void* out = nullptr;
-  void* out_qk = nullptr;
-
-  const int32_t* cache_indir = nullptr;
-  const int32_t* mask = nullptr;  // [B, total_sequence_length]
+// Enum to define quantization granularity.
+enum class KVQuantizationType : int {
+  NONE = 0,
+  PER_TENSOR = 1,
+  PER_CHANNEL = 2,
 };
 
-// Parameters deduced from node attributes and inputs/outputs.
-struct PackedAttentionParameters {
-  int batch_size;
-  int sequence_length;
-  int input_hidden_size;  // hidden size of input
-  int hidden_size;        // hidden size of Q or K
-  int head_size;          // hidden size per head of Q or K
-  int v_hidden_size;      // hidden size of V
-  int v_head_size;        // hidden size per head of V
-  int num_heads;
-  float scale;
-  int token_count;
-  bool broadcast_attn_bias_dim_0;
-  bool broadcast_attn_bias_dim_1;
-  bool use_tf32;
+inline KVQuantizationType StringToKVQuantizationType(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
+  if (s == "NONE") {
+    return KVQuantizationType::NONE;
+  }
+  if (s == "PER_TENSOR") {
+    return KVQuantizationType::PER_TENSOR;
+  }
+  if (s == "PER_CHANNEL") {
+    return KVQuantizationType::PER_CHANNEL;
+  }
+  ORT_THROW("Invalid KV quantization type: '", s,
+            "'. Valid values are: NONE, PER_TENSOR, PER_CHANNEL.");
+}
+
+// Logical element type of a KV cache. Members are named after the ONNX element type they denote.
+// DEFAULT means "whatever the cache tensor's own element type is" and is the only value a model
+// needs when that type is expressible in ONNX, i.e. for float16 / bfloat16 / int8 / float8e4m3fn;
+// naming one of those explicitly is allowed but must agree with the tensor.
+// The sub-byte members have no ONNX tensor type here: they are packed two per byte into a uint8
+// cache, so the last cache dimension holds (head_size + 1) / 2 bytes and logical element 2*i
+// occupies the low-order bits of byte i.
+// Every member is a *signed*, zero-symmetric type. Quantization here has a scale but no zero point
+// (there are no zero-point inputs), so an unsigned logical type such as uint4 or uint8 would need
+// an implied offset of 2^(bits-1) that nothing in the contract can express. INT4 is still *stored*
+// in an unsigned nibble biased by +8, but that is a storage encoding removed on read, not a
+// quantization zero point. Unsigned types must arrive together with zero-point inputs.
+enum class KVCacheDataType : int {
+  DEFAULT = 0,
+  FLOAT16 = 1,
+  BFLOAT16 = 2,
+  INT8 = 3,
+  FLOAT8E4M3FN = 4,
+  INT4 = 5,
+  FLOAT4E2M1 = 6,
 };
 
-// Parameters deduced from node attributes and inputs/outputs.
-struct GroupQueryAttentionParameters {
-  int batch_size;
-  int sequence_length;          // sequence length of input query, key, value
-  int seqlen_past_kv_cache;     // sequence length of past kv tensor
-  int seqlen_present_kv_cache;  // sequence length of present kv tensor
-  int total_sequence_length;    // maximum total sequence length (past_sequence_length + sequence_length) among keys
-  int hidden_size;
-  int num_heads;
-  int head_size;
-  int kv_hidden_size;
-  int kv_num_heads;
-  int num_splits;          // number of splits for splitkv
-  int rotary_dim;          // rotary embedding dimension
-  bool is_unidirectional;  // causal
-  int local_window_size;
-  bool kv_share_buffer;
-  bool is_packed_qkv;
-  bool is_subsequent_prompt;  // indicates whether we have past context and seqlen > 1
-  bool is_first_prompt;       // indicates whether this is first decoding step
-  bool do_rotary;
-  bool rotary_interleaved;
-  bool use_smooth_softmax;
-  float scale;
-  float softcap;
-  AttentionQkvFormat qkv_format;
-  AttentionQkvFormat past_kv_format;
-  int zeros_count;
-  int* zero_ptr;
-};
+// True for the packed sub-byte members, which are stored in a uint8 cache.
+inline bool IsSubByteKVCacheDataType(KVCacheDataType t) {
+  return t == KVCacheDataType::INT4 || t == KVCacheDataType::FLOAT4E2M1;
+}
 
-// Parameters for sparse attention.
-struct SparseAttentionParameters {
-  int batch_size;                  // batch size
-  int sequence_length;             // sequence length of input query, key, value
-  int hidden_size;                 // hidden size of query
-  int num_heads;                   // number of heads of query
-  int head_size;                   // hidden size per head of query, key or value
-  int kv_hidden_size;              // hidden size of key or value
-  int kv_num_heads;                // number of heads of key or value
-  bool do_rotary;                  // whether to use rotary embedding
-  bool rotary_interleaved;         // whether to use interleaved rotary embedding
-  int rotary_dim;                  // rotary embedding dimension
-  int sparse_block_size;           // block size for sparse attention
-  int num_sparse_layout;           // number of sparse layout
-  int stride_col_indices;          // shape of block_col_indices is [num_sparse_layout, stride_col_indices]
-  int stride_row_indices;          // shape of block_row_indices is [num_sparse_layout, stride_row_indices]
-  float scale;                     // scaling factor applied prior to softmax
-  bool is_packed_qkv;              // whether qkv is packed
-  int total_sequence_length;       // maximum total sequence length (past_sequence_length + sequence_length) among keys
-  int max_sequence_length;         // max sequence length for sparse layout
-  int max_rotary_sequence_length;  // max sequence length for rotary cos/sin cache
-  int max_cache_sequence_length;   // max sequence length for kv cache buffer
-  bool past_present_share_buffer;  // whether past_key and present_key share buffer, so is past_value and present_value
-};
+// True for the members that require a scale on read/write.
+inline bool IsQuantizedKVCacheDataType(KVCacheDataType t) {
+  return t != KVCacheDataType::DEFAULT && t != KVCacheDataType::FLOAT16 && t != KVCacheDataType::BFLOAT16;
+}
+
+inline const char* KVCacheDataTypeToString(KVCacheDataType t) {
+  switch (t) {
+    case KVCacheDataType::FLOAT16:
+      return "float16";
+    case KVCacheDataType::BFLOAT16:
+      return "bfloat16";
+    case KVCacheDataType::INT8:
+      return "int8";
+    case KVCacheDataType::FLOAT8E4M3FN:
+      return "float8e4m3fn";
+    case KVCacheDataType::INT4:
+      return "int4";
+    case KVCacheDataType::FLOAT4E2M1:
+      return "float4e2m1";
+    default:
+      return "";
+  }
+}
+
+inline KVCacheDataType StringToKVCacheDataType(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+  if (s.empty()) {
+    return KVCacheDataType::DEFAULT;
+  }
+  if (s == "float16") {
+    return KVCacheDataType::FLOAT16;
+  }
+  if (s == "bfloat16") {
+    return KVCacheDataType::BFLOAT16;
+  }
+  if (s == "int8") {
+    return KVCacheDataType::INT8;
+  }
+  if (s == "float8e4m3fn") {
+    return KVCacheDataType::FLOAT8E4M3FN;
+  }
+  if (s == "int4") {
+    return KVCacheDataType::INT4;
+  }
+  if (s == "float4e2m1") {
+    return KVCacheDataType::FLOAT4E2M1;
+  }
+  ORT_THROW("Invalid KV cache data type: '", s,
+            "'. Valid values are: '' (use the cache tensor's element type), float16, bfloat16, int8, "
+            "float8e4m3fn, int4, float4e2m1. Unsigned types are excluded because quantization here is "
+            "symmetric with no zero point.");
+}
 
 constexpr bool LAYOUT_BSNH = false;
 constexpr bool LAYOUT_BNSH = true;
 
+// Upper bound on the `state_window` attribute of LinearAttention and CausalConvWithState. The
+// window only has to cover the tokens a multi-token predictor can propose, and the state tensors
+// grow linearly with it, so cap it rather than let a model request an unbounded allocation.
+constexpr int64_t kMaxStateWindow = 8;
+
 namespace sparse_attention {
 // Environment variable to enable or disable sparse attention v1 kernel. Default is 0 (enabled).
 constexpr const char* kDisableSparseAttentionV1 = "ORT_DISABLE_SPARSE_ATTENTION_V1";
+
+// Environment variable to disable device-side validation of CSR indices and key sequence lengths.
+// Default is 0 (validation enabled). Set to 1 to skip the validation kernel launch and stream
+// synchronization, which may improve latency when inputs are known to be well-formed.
+// Usage: export ORT_DISABLE_SPARSE_ATTENTION_INPUT_VALIDATION=1
+constexpr const char* kDisableInputValidation = "ORT_DISABLE_SPARSE_ATTENTION_INPUT_VALIDATION";
 }  // namespace sparse_attention
 
 namespace attention {
@@ -211,10 +196,10 @@ enum class AttentionBackend : int {
   // The following TRT kernels might be deprecated in the future.
   TRT_FLASH_ATTENTION = 32,
   TRT_CROSS_ATTENTION = 64,
-  TRT_CAUSAL_ATTENTION = 128,
 
   // Experimental kernels
   LEAN_ATTENTION = 256,
+  DECODER_ATTENTION = 512,  // FasterTransformer's decoder masked multihead attention
 };
 
 // Environment variable to enable debug information of attention kernel to be printed. Default is 0 (disabled).
@@ -226,14 +211,10 @@ constexpr const char* kDisableFusedSelfAttention = "ORT_DISABLE_FUSED_ATTENTION"
 // Environment variable to enable or disable fused cross attention kernel. Default is 0 (enabled).
 constexpr const char* kDisableFusedCrossAttention = "ORT_DISABLE_FUSED_CROSS_ATTENTION";
 
-// Environment variable to enable or disable TRT fused causal attention kernels. Default is 0 (disabled).
-// Note that those causal attention kernels use fp16 accumulation. There is potential accuracy drop using those kernels.
-constexpr const char* kEnableFusedCausalAttention = "ORT_ENABLE_FUSED_CAUSAL_ATTENTION";
-
 // Environment variable to enable or disable cuDNN flash attention.
 constexpr const char* kEnableCudnnFlashAttention = "ORT_ENABLE_CUDNN_FLASH_ATTENTION";
 
-// Environment variable to enable or disable TRT flash attention. This applies to both self and causal attention. Default is 0 (enabled).
+// Environment variable to enable or disable TRT flash attention. Default is 0 (enabled).
 constexpr const char* kDisableTrtFlashAttention = "ORT_DISABLE_TRT_FLASH_ATTENTION";
 
 // Environment variable to enable or disable cutlass memory efficient attention. Default is 0 (enabled).
@@ -244,6 +225,9 @@ constexpr const char* kDisableFlashAttention = "ORT_DISABLE_FLASH_ATTENTION";
 
 // Environment variable to enable or disable lean attention. Default is 0 (disabled).
 constexpr const char* kEnableLeanAttention = "ORT_ENABLE_LEAN_ATTENTION";
+
+// Environment variable to enable or disable FasterTransformer's decoder masked multi-head attention. Default is 0 (enabled).
+constexpr const char* kDisableDecoderAttention = "ORT_DISABLE_DECODER_ATTENTION";
 
 // Minimum sequence length to perfer memory efficient attention when data type is float32
 constexpr const char* kMinSeqLenForEfficientAttentionFp32 = "ORT_MIN_SEQ_LEN_EFFICIENT_ATTENTION_FP32";

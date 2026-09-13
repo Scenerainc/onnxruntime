@@ -14,7 +14,7 @@ from .operators.lstm import LSTMQuant
 from .operators.matmul import MatMulInteger, QDQMatMul, QLinearMatMul
 from .operators.maxpool import QDQMaxPool, QMaxPool
 from .operators.norm import QDQNormalization
-from .operators.pad import QPad
+from .operators.pad import QDQPad, QPad
 from .operators.pooling import QLinearPool
 from .operators.qdq_base_operator import QDQOperatorBase
 from .operators.resize import QDQResize, QResize
@@ -55,6 +55,7 @@ QLinearOpsRegistry = {
     "Reshape": Direct8BitOp,
     "Squeeze": Direct8BitOp,
     "Unsqueeze": Direct8BitOp,
+    "Flatten": Direct8BitOp,
     "Resize": QResize,
     "AveragePool": QLinearPool,
     "Concat": QLinearConcat,
@@ -73,9 +74,12 @@ QDQRegistry = {
     "Transpose": QDQDirect8BitOp,
     "Squeeze": QDQDirect8BitOp,
     "Unsqueeze": QDQDirect8BitOp,
+    "Flatten": QDQDirect8BitOp,
     "Resize": QDQResize,
     "MaxPool": QDQMaxPool,
     "AveragePool": QDQDirect8BitOp,
+    "Slice": QDQDirect8BitOp,
+    "Pad": QDQPad,
     "MatMul": QDQMatMul,
     "Split": QDQSplit,
     "Gather": QDQGather,
@@ -84,6 +88,8 @@ QDQRegistry = {
     "InstanceNormalization": QDQNormalization,
     "LayerNormalization": QDQNormalization,
     "BatchNormalization": QDQNormalization,
+    "TopK": QDQDirect8BitOp,
+    "CumSum": QDQOperatorBase,
 }
 
 

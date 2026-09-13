@@ -1,7 +1,6 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-from typing import List, Union
 
 import onnx
 
@@ -26,6 +25,24 @@ def get_input_from_input_name(onnx_model: onnx.ModelProto, input_name: str) -> o
     raise LookupError(f"The provided output name {input_name} is not a graph input.")
 
 
+def get_value_info_for_name(onnx_model: onnx.ModelProto, name: str) -> onnx.ValueInfoProto:
+    """Returns the value info for `name`, searching graph outputs, inputs, then value_info."""
+
+    for vi in onnx_model.graph.output:
+        if vi.name == name:
+            return vi
+
+    for vi in onnx_model.graph.input:
+        if vi.name == name:
+            return vi
+
+    for vi in onnx_model.graph.value_info:
+        if vi.name == name:
+            return vi
+
+    raise LookupError(f"The provided name {name} was not found in graph outputs, inputs, or value_info.")
+
+
 _GRAPH_TOKEN = 0
 
 
@@ -43,7 +60,7 @@ def generate_graph_name(token: str) -> str:
     return f"onnx::{token}::{_get_token()}"
 
 
-def register_graph_outputs(model: onnx.ModelProto, output_names: Union[List[str], str]) -> None:
+def register_graph_outputs(model: onnx.ModelProto, output_names: list[str] | str) -> None:
     """Register the given output names as graph outputs.
 
     The graph outputs shape information is extracted from the graph value_infos and

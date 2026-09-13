@@ -20,7 +20,7 @@ from onnx.numpy_helper import from_array
 
 from onnxruntime import InferenceSession, get_available_providers
 
-available_providers = [provider for provider in get_available_providers()]
+available_providers = list(get_available_providers())
 
 
 class TestFloat8Gemm8(unittest.TestCase):
@@ -72,19 +72,19 @@ class TestFloat8Gemm8(unittest.TestCase):
         if use_f8:
             assert domain == "com.microsoft"
             inits.append(from_array(np.array([1], dtype=np.float32), name="one"))
-            kwargs = dict(
-                domain=domain,
-                dtype=dtype,
-            )
+            kwargs = {
+                "domain": domain,
+                "dtype": dtype,
+            }
             if activation is not None:
                 kwargs["activation"] = activation
             op_name = "GemmFloat8"
         elif domain == "com.microsoft":
             op_name = "GemmFloat8"
-            kwargs = dict(
-                domain=domain,
-                dtype=dtype,
-            )
+            kwargs = {
+                "domain": domain,
+                "dtype": dtype,
+            }
         else:
             op_name = "Gemm"
         nodes = [
@@ -139,11 +139,6 @@ class TestFloat8Gemm8(unittest.TestCase):
         providers = ["CPUExecutionProvider"]
         if "CUDAExecutionProvider" in available_providers:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        elif "ROCMExecutionProvider" in available_providers:
-            providers = [
-                ("ROCMExecutionProvider", {"tunable_op_enable": "1", "tunable_op_tuning_enable": "1"}),
-                ("CPUExecutionProvider", {}),
-            ]
 
         expected = (a.T if kwargs.get("transA", 0) else a) @ (b.T if kwargs.get("transB", 0) else b)
         expected *= kwargs.get("alpha", 1.0)
@@ -173,16 +168,16 @@ class TestFloat8Gemm8(unittest.TestCase):
 
                 raise AssertionError(
                     f"Gemm ERROR len(inputs)={len(feeds)}"
-                    f"\na@b=\n{check(lambda:a@b)}"
-                    f"\na.T@b=\n{check(lambda:a.T@b)}"
-                    f"\na@b.T=\n{check(lambda:a@b.T)}"
-                    f"\na.T@b.T=\n{check(lambda:a.T@b.T)}"
-                    f"\n----\nb@a=\n{check(lambda:b@a)}"
-                    f"\nb.T@a=\n{check(lambda:b.T@a)}"
-                    f"\nb@a.T=\n{check(lambda:b@a.T)}"
-                    f"\nb.T@a.T=\n{check(lambda:b.T@a.T)}"
-                    f"\n----\nexpected=\n{expected[:2,:2]}"
-                    f"\n----\ngot=\n{y[:2,:2]}"
+                    f"\na@b=\n{check(lambda: a @ b)}"
+                    f"\na.T@b=\n{check(lambda: a.T @ b)}"
+                    f"\na@b.T=\n{check(lambda: a @ b.T)}"
+                    f"\na.T@b.T=\n{check(lambda: a.T @ b.T)}"
+                    f"\n----\nb@a=\n{check(lambda: b @ a)}"
+                    f"\nb.T@a=\n{check(lambda: b.T @ a)}"
+                    f"\nb@a.T=\n{check(lambda: b @ a.T)}"
+                    f"\nb.T@a.T=\n{check(lambda: b.T @ a.T)}"
+                    f"\n----\nexpected=\n{expected[:2, :2]}"
+                    f"\n----\ngot=\n{y[:2, :2]}"
                     f"\nkwargs={kwargs}"
                 ) from e
 
@@ -225,16 +220,16 @@ class TestFloat8Gemm8(unittest.TestCase):
 
             raise AssertionError(
                 f"Gemm ERROR len(inputs)={len(feeds)}"
-                f"\na@b=\n{check(lambda:a@b)}"
-                f"\na.T@b=\n{check(lambda:a.T@b)}"
-                f"\na@b.T=\n{check(lambda:a@b.T)}"
-                f"\na.T@b.T=\n{check(lambda:a.T@b.T)}"
-                f"\n----\nb@a=\n{check(lambda:b@a)}"
-                f"\nb.T@a=\n{check(lambda:b.T@a)}"
-                f"\nb@a.T=\n{check(lambda:b@a.T)}"
-                f"\nb.T@a.T=\n{check(lambda:b.T@a.T)}"
-                f"\n----\nexpected=\n{expected[:2,:2]}"
-                f"\n----\ngot=\n{y[:2,:2]}"
+                f"\na@b=\n{check(lambda: a @ b)}"
+                f"\na.T@b=\n{check(lambda: a.T @ b)}"
+                f"\na@b.T=\n{check(lambda: a @ b.T)}"
+                f"\na.T@b.T=\n{check(lambda: a.T @ b.T)}"
+                f"\n----\nb@a=\n{check(lambda: b @ a)}"
+                f"\nb.T@a=\n{check(lambda: b.T @ a)}"
+                f"\nb@a.T=\n{check(lambda: b @ a.T)}"
+                f"\nb.T@a.T=\n{check(lambda: b.T @ a.T)}"
+                f"\n----\nexpected=\n{expected[:2, :2]}"
+                f"\n----\ngot=\n{y[:2, :2]}"
                 f"\nkwargs={kwargs}"
             ) from e
         self.assertEqual(expected.shape, y.shape)
@@ -340,29 +335,6 @@ class TestFloat8Gemm8(unittest.TestCase):
         self.assertEqual(expected.shape, got[0].shape)
         self.assertEqual(expected.dtype, got[0].dtype)
         assert_allclose(expected, got[0])
-
-    @parameterized.parameterized.expand(
-        [
-            ("FLOAT8E4M3FN", "FLOAT16", 0, 0),
-            ("FLOAT16", "FLOAT8E4M3FN", 0, 0),
-            ("FLOAT16", "FLOAT8E4M3FN", 0, 1),
-        ]
-    )
-    @unittest.skipIf("ROCMExecutionProvider" not in available_providers, reason="Not running without ROCm.")
-    @unittest.skipIf(not hasattr(TensorProto, "FLOAT8E4M3FN"), reason="needs onnx>=1.14.0")
-    def test_model_rocm_gemm_float8_e4m3(self, a_float_name, b_float_name, transA, transB):
-        self.common_test_model_gemm(
-            a_float_name=a_float_name,
-            b_float_name=b_float_name,
-            c_float_name="FLOAT8E4M3FN",
-            rtol=0.5,
-            dtype=TensorProto.FLOAT16,
-            transA=0,
-            transB=transB,
-            scaleY=False,
-            alpha=10.0,
-            beta=0.0,
-        )
 
 
 if __name__ == "__main__":

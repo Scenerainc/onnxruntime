@@ -30,9 +30,12 @@ void SGEMM(benchmark::State& state, bool pack_b, bool trans_a, bool trans_b, flo
                                                  tpo, onnxruntime::concurrency::ThreadPoolType::INTRA_OP));
 
   if (pack_b) {
-    size_t pack_b_size = MlasGemmPackBSize(N, K);
+    CBLAS_TRANSPOSE transB_enum = trans_b ? CblasTrans : CblasNoTrans;
+    CBLAS_TRANSPOSE transA_enum = trans_a ? CblasTrans : CblasNoTrans;
+
+    size_t pack_b_size = MlasGemmPackBSize(transA_enum, transB_enum, N, K, nullptr);
     std::vector<float> B_packed(pack_b_size);
-    MlasGemmPackB(CblasNoTrans, N, K, B.data(), N, B_packed.data());
+    MlasGemmPackB(transA_enum, transB_enum, N, K, B.data(), N, B_packed.data(), nullptr);
 
     MlasGemm(
         trans_a ? CblasTrans : CblasNoTrans,
@@ -46,7 +49,7 @@ void SGEMM(benchmark::State& state, bool pack_b, bool trans_a, bool trans_b, flo
         beta,
         C.data(),
         N,
-        tp.get());
+        tp.get(), nullptr);
 
     for (auto _ : state) {
       MlasGemm(
@@ -61,7 +64,7 @@ void SGEMM(benchmark::State& state, bool pack_b, bool trans_a, bool trans_b, flo
           beta,
           C.data(),
           N,
-          tp.get());
+          tp.get(), nullptr);
     }
 
   } else {
@@ -79,7 +82,7 @@ void SGEMM(benchmark::State& state, bool pack_b, bool trans_a, bool trans_b, flo
         beta,
         C.data(),
         N,
-        tp.get());
+        tp.get(), nullptr);
 
     for (auto _ : state) {
       MlasGemm(
@@ -96,19 +99,19 @@ void SGEMM(benchmark::State& state, bool pack_b, bool trans_a, bool trans_b, flo
           beta,
           C.data(),
           N,
-          tp.get());
+          tp.get(), nullptr);
     }
   }
 }
 
-static void GemmSizeWithOne(benchmark::internal::Benchmark* b) {
+static void GemmSizeWithOne(benchmark::Benchmark* b) {
   b->ArgNames(sgemm_bench_arg_names);
   b->ArgsProduct({{1}, {63, 255, 1023}, {63, 255, 1023}});
   b->ArgsProduct({{63, 255, 1023}, {1}, {63, 255, 1023}});
   b->ArgsProduct({{63, 255, 1023}, {63, 255, 1023}, {1}});
 }
 
-static void GemmSizeProducts(benchmark::internal::Benchmark* b) {
+static void GemmSizeProducts(benchmark::Benchmark* b) {
   b->ArgNames(sgemm_bench_arg_names);
   b->ArgsProduct({{63, 255, 1023}, {63, 255, 1023}, {63, 255, 1023}});
 }
@@ -126,7 +129,7 @@ BENCHMARK_CAPTURE(SGEMM, GEMV_ABTrans, false, true, true)->Apply(GemmSizeWithOne
 BENCHMARK_CAPTURE(SGEMM, PACKB_NoTransA, true, false, false)->Apply(GemmSizeProducts)->UseRealTime();
 BENCHMARK_CAPTURE(SGEMM, PACKB_TransA, true, true, false)->Apply(GemmSizeProducts)->UseRealTime();
 
-static void GemmLLMSizeProducts(benchmark::internal::Benchmark* b) {
+static void GemmLLMSizeProducts(benchmark::Benchmark* b) {
   b->ArgNames(sgemm_bench_arg_names);
   b->ArgsProduct({{1, 1024, 2048}, {4096, 11008}, {4096, 11008}});
 }

@@ -3,6 +3,7 @@
 
 #include "core/providers/cuda/tensor/gather_elements.h"
 
+#include "core/providers/cuda/tensor/gather_elements_common.h"
 #include "core/providers/cuda/tensor/gather_elements_impl.h"
 #include "core/providers/cpu/tensor/utils.h"
 
@@ -162,6 +163,8 @@ Status GatherElements::ComputeInternal(OpKernelContext* context) const {
   // Validate input shapes and ranks (invoke the static method in the CPU GatherElements kernel that hosts the shared
   // checks)
   ORT_RETURN_IF_ERROR(onnxruntime::GatherElements::ValidateInputShapes(input_shape, indices_shape, axis));
+  ORT_RETURN_IF_NOT(IsGatherElementsElementCountSupported(indices_size),
+                    GatherElementsElementCountErrorMessage(indices_size));
 
   // create output tensor
   auto* output_tensor = context->Output(0, indices_shape);
@@ -174,8 +177,8 @@ Status GatherElements::ComputeInternal(OpKernelContext* context) const {
   TensorShapeVector input_shape_vec = input_shape.AsShapeVector();
   TensorShapeVector indices_shape_vec = indices_shape.AsShapeVector();
   TensorShapeVector* p_indices_strides_vec = nullptr;
-  TensorShapeVector indices_strides_vec;
 #ifdef ENABLE_STRIDED_TENSORS
+  TensorShapeVector indices_strides_vec;
   if (!indices_tensor->IsContiguous()) {
     indices_strides_vec = ToShapeVector(indices_tensor->Strides());
     p_indices_strides_vec = &indices_strides_vec;

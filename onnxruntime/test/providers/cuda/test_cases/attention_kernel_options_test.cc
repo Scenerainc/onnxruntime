@@ -10,12 +10,22 @@
 
 #include <unordered_map>
 #include <string>
-
 using onnxruntime::AttentionKernelOptions;
 using onnxruntime::contrib::attention::AttentionBackend;
 
 namespace onnxruntime {
 namespace test {
+
+TEST(AttentionKernelDebugInfoTest, LatentAttention) {
+  AttentionKernelDebugInfo debug_info;
+  debug_info.use_latent_attention = true;
+
+  testing::internal::CaptureStdout();
+  debug_info.Print("PagedAttention", "", true, false);
+  const std::string debug_output = testing::internal::GetCapturedStdout();
+
+  EXPECT_NE(debug_output.find("SdpaKernel=LATENT_ATTENTION"), std::string::npos) << debug_output;
+}
 
 TEST(AttentionKernelOptionsTest, NonZeroValue) {
   {
@@ -29,7 +39,7 @@ TEST(AttentionKernelOptionsTest, NonZeroValue) {
     ASSERT_FALSE(options.UseUnfusedAttention());
     ASSERT_FALSE(options.UseTrtFlashAttention());
     ASSERT_FALSE(options.UseTrtCrossAttention());
-    ASSERT_FALSE(options.UseTrtCausalAttention());
+    ASSERT_FALSE(options.UseDecoderAttention());
     EXPECT_EQ(options.MinSeqLenForFlashAttentionPackedQkv(), 0);
     EXPECT_EQ(options.MinSeqLenForEfficientAttentionFp32(), 0);
   }
@@ -45,7 +55,7 @@ TEST(AttentionKernelOptionsTest, NonZeroValue) {
     ASSERT_TRUE(options.UseUnfusedAttention());
     ASSERT_FALSE(options.UseTrtFlashAttention());
     ASSERT_FALSE(options.UseTrtCrossAttention());
-    ASSERT_FALSE(options.UseTrtCausalAttention());
+    ASSERT_FALSE(options.UseDecoderAttention());
     EXPECT_EQ(options.MinSeqLenForFlashAttentionPackedQkv(), 0);
     EXPECT_EQ(options.MinSeqLenForEfficientAttentionFp32(), 0);
   }
@@ -61,7 +71,7 @@ TEST(AttentionKernelOptionsTest, NonZeroValue) {
     ASSERT_FALSE(options.UseUnfusedAttention());
     ASSERT_FALSE(options.UseTrtFlashAttention());
     ASSERT_FALSE(options.UseTrtCrossAttention());
-    ASSERT_FALSE(options.UseTrtCausalAttention());
+    ASSERT_FALSE(options.UseDecoderAttention());
     EXPECT_EQ(options.MinSeqLenForFlashAttentionPackedQkv(), 0);
     EXPECT_EQ(options.MinSeqLenForEfficientAttentionFp32(), 0);
   }
@@ -77,14 +87,14 @@ TEST(AttentionKernelOptionsTest, NonZeroValue) {
     ASSERT_FALSE(options.UseUnfusedAttention());
     ASSERT_TRUE(options.UseTrtFlashAttention());
     ASSERT_FALSE(options.UseTrtCrossAttention());
-    ASSERT_FALSE(options.UseTrtCausalAttention());
+    ASSERT_FALSE(options.UseDecoderAttention());
     EXPECT_EQ(options.MinSeqLenForFlashAttentionPackedQkv(), 0);
     EXPECT_EQ(options.MinSeqLenForEfficientAttentionFp32(), 0);
   }
 
   {
     AttentionKernelOptions options;
-    int value = static_cast<int>(AttentionBackend::TRT_CROSS_ATTENTION) | static_cast<int>(AttentionBackend::TRT_CAUSAL_ATTENTION);
+    int value = static_cast<int>(AttentionBackend::TRT_CROSS_ATTENTION);
     options.InitializeOnce(value, false);
     ASSERT_FALSE(options.UseFlashAttention());
     ASSERT_FALSE(options.UseEfficientAttention());
@@ -93,7 +103,23 @@ TEST(AttentionKernelOptionsTest, NonZeroValue) {
     ASSERT_FALSE(options.UseUnfusedAttention());
     ASSERT_FALSE(options.UseTrtFlashAttention());
     ASSERT_TRUE(options.UseTrtCrossAttention());
-    ASSERT_TRUE(options.UseTrtCausalAttention());
+    ASSERT_FALSE(options.UseDecoderAttention());
+    EXPECT_EQ(options.MinSeqLenForFlashAttentionPackedQkv(), 0);
+    EXPECT_EQ(options.MinSeqLenForEfficientAttentionFp32(), 0);
+  }
+
+  {
+    AttentionKernelOptions options;
+    int value = static_cast<int>(AttentionBackend::DECODER_ATTENTION);
+    options.InitializeOnce(value, false);
+    ASSERT_FALSE(options.UseFlashAttention());
+    ASSERT_FALSE(options.UseEfficientAttention());
+    ASSERT_FALSE(options.UseTrtFusedAttention());
+    ASSERT_FALSE(options.UseCudnnFlashAttention());
+    ASSERT_FALSE(options.UseUnfusedAttention());
+    ASSERT_FALSE(options.UseTrtFlashAttention());
+    ASSERT_FALSE(options.UseTrtCrossAttention());
+    ASSERT_TRUE(options.UseDecoderAttention());
     EXPECT_EQ(options.MinSeqLenForFlashAttentionPackedQkv(), 0);
     EXPECT_EQ(options.MinSeqLenForEfficientAttentionFp32(), 0);
   }
@@ -109,8 +135,7 @@ TEST(AttentionKernelOptionsTest, NonZeroValue) {
             {onnxruntime::contrib::attention::kEnableCudnnFlashAttention, "1"},
             {onnxruntime::contrib::attention::kDisableFusedCrossAttention, "0"},
             {onnxruntime::contrib::attention::kDisableMemoryEfficientAttention, "0"},
-            {onnxruntime::contrib::attention::kEnableFusedCausalAttention, "1"},
-            {onnxruntime::contrib::attention::kEnableFusedCausalAttention, "1"}}};
+            {onnxruntime::contrib::attention::kDisableDecoderAttention, "0"}}};
     AttentionKernelOptions options;
     int value = static_cast<int>(AttentionBackend::FLASH_ATTENTION);
     options.InitializeOnce(value, false);
@@ -121,7 +146,7 @@ TEST(AttentionKernelOptionsTest, NonZeroValue) {
     ASSERT_FALSE(options.UseUnfusedAttention());
     ASSERT_FALSE(options.UseTrtFlashAttention());
     ASSERT_FALSE(options.UseTrtCrossAttention());
-    ASSERT_FALSE(options.UseTrtCausalAttention());
+    ASSERT_FALSE(options.UseDecoderAttention());
     EXPECT_EQ(options.MinSeqLenForFlashAttentionPackedQkv(), 0);
     EXPECT_EQ(options.MinSeqLenForEfficientAttentionFp32(), 0);
   }
@@ -135,8 +160,7 @@ TEST(AttentionKernelOptionsTest, NonZeroValue) {
             {onnxruntime::contrib::attention::kDisableFusedSelfAttention, "1"},
             {onnxruntime::contrib::attention::kDisableFusedCrossAttention, "1"},
             {onnxruntime::contrib::attention::kDisableMemoryEfficientAttention, "1"},
-            {onnxruntime::contrib::attention::kEnableFusedCausalAttention, "0"},
-            {onnxruntime::contrib::attention::kEnableFusedCausalAttention, "0"},
+            {onnxruntime::contrib::attention::kDisableDecoderAttention, "1"},
             {onnxruntime::contrib::attention::kMinSeqLenForFlashAttentionPackedQKV, "128"},
             {onnxruntime::contrib::attention::kMinSeqLenForEfficientAttentionFp32, "256"}}};
     AttentionKernelOptions options;
@@ -149,7 +173,7 @@ TEST(AttentionKernelOptionsTest, NonZeroValue) {
     ASSERT_FALSE(options.UseUnfusedAttention());
     ASSERT_FALSE(options.UseTrtFlashAttention());
     ASSERT_FALSE(options.UseTrtCrossAttention());
-    ASSERT_FALSE(options.UseTrtCausalAttention());
+    ASSERT_FALSE(options.UseDecoderAttention());
     EXPECT_EQ(options.MinSeqLenForFlashAttentionPackedQkv(), 128);
     EXPECT_EQ(options.MinSeqLenForEfficientAttentionFp32(), 256);
   }
@@ -166,8 +190,7 @@ TEST(AttentionKernelOptionsTest, DefaultOptionWithEnvVar) {
           {onnxruntime::contrib::attention::kEnableCudnnFlashAttention, "1"},
           {onnxruntime::contrib::attention::kDisableFusedCrossAttention, "0"},
           {onnxruntime::contrib::attention::kDisableMemoryEfficientAttention, "0"},
-          {onnxruntime::contrib::attention::kEnableFusedCausalAttention, "1"},
-          {onnxruntime::contrib::attention::kEnableFusedCausalAttention, "1"},
+          {onnxruntime::contrib::attention::kDisableDecoderAttention, "0"},
           {onnxruntime::contrib::attention::kMinSeqLenForFlashAttentionPackedQKV, "128"},
           {onnxruntime::contrib::attention::kMinSeqLenForEfficientAttentionFp32, "256"}}};
   AttentionKernelOptions options;
@@ -179,8 +202,7 @@ TEST(AttentionKernelOptionsTest, DefaultOptionWithEnvVar) {
   ASSERT_TRUE(options.UseUnfusedAttention());
   ASSERT_TRUE(options.UseTrtFlashAttention());
   ASSERT_TRUE(options.UseTrtCrossAttention());
-  ASSERT_TRUE(options.UseTrtCausalAttention());
-  ASSERT_TRUE(options.UseTrtCausalAttention());
+  ASSERT_TRUE(options.UseDecoderAttention());
   EXPECT_EQ(options.MinSeqLenForFlashAttentionPackedQkv(), 128);
   EXPECT_EQ(options.MinSeqLenForEfficientAttentionFp32(), 256);
 }
@@ -196,8 +218,7 @@ TEST(AttentionKernelOptionsTest, DefaultMinSeqLens) {
           {onnxruntime::contrib::attention::kDisableFusedCrossAttention, "1"},
           {onnxruntime::contrib::attention::kEnableCudnnFlashAttention, "0"},
           {onnxruntime::contrib::attention::kDisableMemoryEfficientAttention, "1"},
-          {onnxruntime::contrib::attention::kEnableFusedCausalAttention, "0"},
-          {onnxruntime::contrib::attention::kEnableFusedCausalAttention, "0"}}};
+          {onnxruntime::contrib::attention::kDisableDecoderAttention, "1"}}};
   AttentionKernelOptions options;
   options.InitializeOnce(value, false);
   ASSERT_FALSE(options.UseFlashAttention());
@@ -207,8 +228,7 @@ TEST(AttentionKernelOptionsTest, DefaultMinSeqLens) {
   ASSERT_TRUE(options.UseUnfusedAttention());
   ASSERT_FALSE(options.UseTrtFlashAttention());
   ASSERT_FALSE(options.UseTrtCrossAttention());
-  ASSERT_FALSE(options.UseTrtCausalAttention());
-  ASSERT_FALSE(options.UseTrtCausalAttention());
+  ASSERT_FALSE(options.UseDecoderAttention());
   EXPECT_EQ(options.MinSeqLenForFlashAttentionPackedQkv(),
             onnxruntime::contrib::attention::kDefaultMinSeqLenForFlashAttentionPackedQKV);
   EXPECT_EQ(options.MinSeqLenForEfficientAttentionFp32(),

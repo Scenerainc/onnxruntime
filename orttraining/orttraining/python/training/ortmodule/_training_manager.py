@@ -4,7 +4,6 @@
 # --------------------------------------------------------------------------
 
 from logging import Logger
-from typing import Tuple
 
 import onnx
 import torch
@@ -48,7 +47,7 @@ class TrainingManager(GraphExecutionManager):
         device: torch.device,
         gradient_accumulation_manager: GradientAccumulationManager,
         *inputs,
-    ) -> Tuple[Tuple[torch.Tensor, ...], _RunStateInfo]:
+    ) -> tuple[tuple[torch.Tensor, ...], _RunStateInfo]:
         """Runs the forward pass on `execution_session` with given `onnx_model`, `device` and `inputs`
 
         Args:
@@ -85,7 +84,7 @@ class TrainingManager(GraphExecutionManager):
         # Run and return module outputs.
         execution_session.run_forward(forward_inputs, forward_outputs, state, gradient_accumulation_manager.cache)
 
-        user_outputs: Tuple[torch.Tensor, ...] = gradient_accumulation_manager.extract_outputs_and_maybe_update_cache(
+        user_outputs: tuple[torch.Tensor, ...] = gradient_accumulation_manager.extract_outputs_and_maybe_update_cache(
             forward_outputs, device
         )
 
@@ -343,8 +342,6 @@ class TrainingManager(GraphExecutionManager):
 
         # Apply registered graph transformers to the optimized model
         device_type = self._device.type
-        if device_type == "cuda" and self.is_rocm_pytorch:
-            device_type = "rocm"
         GraphOptimizerRegistry.optimize_all(
             type(self._flattened_module._original_module).__name__, device_type, self._onnx_models.optimized_model.graph
         )

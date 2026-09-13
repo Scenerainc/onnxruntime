@@ -64,6 +64,10 @@ EtwRegistrationManager& EtwRegistrationManager::Instance() {
   return instance;
 }
 
+bool EtwRegistrationManager::SupportsETW() {
+  return true;
+}
+
 bool EtwRegistrationManager::IsEnabled() const {
   std::lock_guard<std::mutex> lock(provider_change_mutex_);
   return is_enabled_;
@@ -158,8 +162,11 @@ void EtwRegistrationManager::LazyInitialize() {
       initialization_status_ = InitializationStatus::Initializing;
       etw_status_ = ::TraceLoggingRegisterEx(etw_provider_handle, ORT_TL_EtwEnableCallback, nullptr);
       if (FAILED(etw_status_)) {
+        // Registration can fail when running under Low Integrity process, and should be non-fatal
         initialization_status_ = InitializationStatus::Failed;
-        ORT_THROW("ETW registration failed. Logging will be broken: " + std::to_string(etw_status_));
+        // Injection of ETW logger can happen very early if ETW provider was already listening.
+        // Don't use LOGS_DEFAULT here or can get "Attempt to use DefaultLogger but none has been registered"
+        std::cerr << "Error in ETW registration: " << std::to_string(etw_status_) << std::endl;
       }
       initialization_status_ = InitializationStatus::Initialized;
     }
@@ -176,7 +183,9 @@ void EtwRegistrationManager::InvokeCallbacks(LPCGUID SourceId, ULONG IsEnabled, 
 
   std::lock_guard<std::mutex> lock(callbacks_mutex_);
   for (const auto& callback : callbacks_) {
-    (*callback)(SourceId, IsEnabled, Level, MatchAnyKeyword, MatchAllKeyword, FilterData, CallbackContext);
+    if (callback != nullptr) {
+      (*callback)(SourceId, IsEnabled, Level, MatchAnyKeyword, MatchAllKeyword, FilterData, CallbackContext);
+    }
   }
 }
 
@@ -243,5 +252,19 @@ void EtwSink::SendImpl(const Timestamp& timestamp, const std::string& logger_id,
 }
 }  // namespace logging
 }  // namespace onnxruntime
+#else
+// ETW is not supported on this platform but should still define a dummy EtwRegistrationManager
+// so that it can be used in the EP provider bridge.
+namespace onnxruntime {
+namespace logging {
+EtwRegistrationManager& EtwRegistrationManager::Instance() {
+  static EtwRegistrationManager instance;
+  return instance;
+}
 
+bool EtwRegistrationManager::SupportsETW() {
+  return false;
+}
+}  // namespace logging
+}  // namespace onnxruntime
 #endif  // ETW_TRACE_LOGGING_SUPPORTED

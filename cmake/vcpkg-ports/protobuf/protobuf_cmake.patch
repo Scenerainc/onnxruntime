@@ -1,0 +1,41 @@
+diff --git a/cmake/install.cmake b/cmake/install.cmake
+index 65765ca29..81084b9d4 100644
+--- a/cmake/install.cmake
++++ b/cmake/install.cmake
+@@ -65,7 +65,7 @@ if (protobuf_BUILD_PROTOC_BINARIES)
+     endforeach ()
+   endif ()
+   foreach (binary IN LISTS _protobuf_binaries)
+-    if (UNIX AND NOT APPLE)
++    if (UNIX AND NOT APPLE AND NOT protobuf_MSVC_STATIC_RUNTIME)
+       set_property(TARGET ${binary}
+         PROPERTY INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+     elseif (APPLE)
+  diff --git a/cmake/libprotobuf-lite.cmake b/cmake/libprotobuf-lite.cmake
+  index 6a923f6c8..911881eb4 100644
+  --- a/cmake/libprotobuf-lite.cmake
+  +++ b/cmake/libprotobuf-lite.cmake
+  @@ -46 +46 @@ add_library(protobuf::libprotobuf-lite ALIAS libprotobuf-lite)
+  -target_link_libraries(libprotobuf-lite PRIVATE utf8_validity)
+  +target_link_libraries(libprotobuf-lite PUBLIC utf8_validity)
+diff --git a/src/google/protobuf/compiler/command_line_interface.cc b/src/google/protobuf/compiler/command_line_interface.cc
+index cd95c8b41..d4825180d 100644
+--- a/src/google/protobuf/compiler/command_line_interface.cc
++++ b/src/google/protobuf/compiler/command_line_interface.cc
+@@ -272,12 +272,15 @@ void AddDefaultProtoPaths(
+     paths->emplace_back("", std::move(include_path));
+     return;
+   }
+-  // Check if the upper level directory has an "include" subdirectory.
++  // change "'$/bin' is next to 'include'" assumption to "'$/bin/tools' is next to 'include'"
++  for (int i = 0; i < 2; i++)
++  {
+   pos = path.find_last_of("/\\");
+   if (pos == std::string::npos || pos == 0) {
+     return;
+   }
+   path = path.substr(0, pos);
++  }
+   include_path = absl::StrCat(path, "/include");
+   if (IsInstalledProtoPath(include_path)) {
+     paths->emplace_back("", std::move(include_path));

@@ -26,6 +26,8 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateUnaryOpBuilder("Log", op_registrations);
     CreateUnaryOpBuilder("Neg", op_registrations);
     CreateUnaryOpBuilder("Reciprocal", op_registrations);
+    CreateUnaryOpBuilder("Round", op_registrations);
+    CreateUnaryOpBuilder("Sign", op_registrations);
     CreateUnaryOpBuilder("Sin", op_registrations);
     CreateUnaryOpBuilder("Sqrt", op_registrations);
     CreateUnaryOpBuilder("Tan", op_registrations);
@@ -80,6 +82,14 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateConcatOpBuilder("Concat", op_registrations);
   }
 
+  {  // CumSum
+    CreateCumSumOpBuilder("CumSum", op_registrations);
+  }
+
+  {  // DepthToSpace
+    CreateDepthToSpaceOpBuilder("DepthToSpace", op_registrations);
+  }
+
   {  // Dropout
     CreateDropoutOpBuilder("Dropout", op_registrations);
   }
@@ -90,6 +100,10 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateDynamicQuantizeLinearOpBuilder("DynamicQuantizeLinear", op_registrations);
   }
 
+  {  // Einsum
+    CreateEinsumOpBuilder("Einsum", op_registrations);
+  }
+
   {  // Expand
     CreateExpandOpBuilder("Expand", op_registrations);
   }
@@ -98,12 +112,20 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateGatherOpBuilder("Gather", op_registrations);
   }
 
+  {  // GatherBlockQuantized
+    CreateGatherBlockQuantizedOpBuilder("GatherBlockQuantized", op_registrations);
+  }
+
   {  // GatherElements
     CreateGatherElementsOpBuilder("GatherElements", op_registrations);
   }
 
   {  // GatherND
     CreateGatherNDOpBuilder("GatherND", op_registrations);
+  }
+
+  {  // GroupQueryAttention
+    CreateGroupQueryAttentionOpBuilder("GroupQueryAttention", op_registrations);
   }
 
   {  // Flatten
@@ -123,6 +145,8 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
   {  // Logical
     CreateLogicalOpBuilder("And", op_registrations);
     CreateLogicalOpBuilder("Equal", op_registrations);
+    CreateLogicalOpBuilder("IsInf", op_registrations);
+    CreateLogicalOpBuilder("IsNaN", op_registrations);
     CreateLogicalOpBuilder("Greater", op_registrations);
     CreateLogicalOpBuilder("GreaterOrEqual", op_registrations);
     CreateLogicalOpBuilder("Less", op_registrations);
@@ -132,8 +156,20 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateLogicalOpBuilder("Xor", op_registrations);
   }
 
+  {  // LRN
+    CreateLRNOpBuilder("LRN", op_registrations);
+  }
+
+  {  // LpNormalization
+    CreateLpNormalizationOpBuilder("LpNormalization", op_registrations);
+  }
+
   {  // LSTM
     CreateLstmOpBuilder("LSTM", op_registrations);
+  }
+
+  {  // MatMulNBits
+    CreateMatMulNBitsOpBuilder("MatMulNBits", op_registrations);
   }
 
   {  // Max/Min
@@ -141,10 +177,17 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateMaxMinOpBuilder("Min", op_registrations);
   }
 
+  {  // MultiHeadAttention
+    CreateMultiHeadAttentionOpBuilder("MultiHeadAttention", op_registrations);
+  }
+
   {  // Normalization
     CreateNormalizationOpBuilder("BatchNormalization", op_registrations);
     CreateNormalizationOpBuilder("InstanceNormalization", op_registrations);
     CreateNormalizationOpBuilder("LayerNormalization", op_registrations);
+    CreateNormalizationOpBuilder("SkipLayerNormalization", op_registrations);
+    CreateNormalizationOpBuilder("SimplifiedLayerNormalization", op_registrations);
+    CreateNormalizationOpBuilder("SkipSimplifiedLayerNormalization", op_registrations);
   }
 
   {  // Pad
@@ -179,6 +222,10 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
 
   {  // Resize
     CreateResizeOpBuilder("Resize", op_registrations);
+  }
+
+  {  // RotaryEmbedding
+    CreateRotaryEmbeddingOpBuilder("RotaryEmbedding", op_registrations);
   }
 
   {  // ScatterElements

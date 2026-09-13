@@ -188,8 +188,14 @@ static Node* ReorderCastAndTranspose(Graph& graph, Node* cast,
   return &new_transpose;
 }
 
-// Check whether the element_type is an allowed FusedMatMul data type or not.
-constexpr static bool IsAllowedFusedMatMulDataType(ONNX_NAMESPACE::TensorProto_DataType element_type) {
+// Check whether the element_type is supported by FusedMatMul for the assigned EP.
+static bool IsAllowedFusedMatMulDataType(ONNX_NAMESPACE::TensorProto_DataType element_type,
+                                         std::string_view execution_provider_type) {
+  if (execution_provider_type == kCpuExecutionProvider) {
+    return element_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT ||
+           element_type == ONNX_NAMESPACE::TensorProto_DataType_DOUBLE;
+  }
+
   return element_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT ||
          element_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16 ||
          element_type == ONNX_NAMESPACE::TensorProto_DataType_DOUBLE ||
@@ -306,7 +312,22 @@ Status MatmulTransposeFusion::ApplyImpl(Graph& graph, bool& modified, int graph_
 
     NodeArg* left_input = node.MutableInputDefs()[0];
     auto left_type = left_input->TypeAsProto()->tensor_type().elem_type();
-    if (!IsAllowedFusedMatMulDataType(static_cast<ONNX_NAMESPACE::TensorProto_DataType>(left_type))) {
+    if (!IsAllowedFusedMatMulDataType(static_cast<ONNX_NAMESPACE::TensorProto_DataType>(left_type),
+                                      node.GetExecutionProviderType())) {
+      continue;
+    }
+
+    NodeArg* right_input = node.MutableInputDefs()[1];
+    auto right_type = right_input->TypeAsProto()->tensor_type().elem_type();
+    if (!IsAllowedFusedMatMulDataType(static_cast<ONNX_NAMESPACE::TensorProto_DataType>(right_type),
+                                      node.GetExecutionProviderType())) {
+      continue;
+    }
+
+    if (left_input == right_input) {
+      // If both inputs are the same, we skip the fusion.
+      // Currently, this situation is not handled correctly in the code below.
+      // Otherwise, the model initialization may fail. See https://github.com/microsoft/onnxruntime/issues/24341.
       continue;
     }
 
@@ -323,12 +344,6 @@ Status MatmulTransposeFusion::ApplyImpl(Graph& graph, bool& modified, int graph_
                                          is_trans_batch_left);
         }
       }
-    }
-
-    NodeArg* right_input = node.MutableInputDefs()[1];
-    auto right_type = right_input->TypeAsProto()->tensor_type().elem_type();
-    if (!IsAllowedFusedMatMulDataType(static_cast<ONNX_NAMESPACE::TensorProto_DataType>(right_type))) {
-      continue;
     }
 
     bool is_trans_right = false;
@@ -405,13 +420,6 @@ Status MatmulTransposeFusion::ApplyImpl(Graph& graph, bool& modified, int graph_
     matmul_node.AddAttribute("alpha", alpha);
     // Assign provider to this new node. Provider should be same as the provider for old node.
     matmul_node.SetExecutionProviderType(node.GetExecutionProviderType());
-#ifdef USE_ROCM
-    // forward the __backwardpass, if present
-    auto& attrs = node.GetAttributes();
-    if (attrs.count("__backwardpass")) {
-      matmul_node.AddAttribute("__backwardpass", static_cast<int64_t>(attrs.at("__backwardpass").i()));
-    }
-#endif
 
     graph_utils::FinalizeNodeFusion(graph, matmul_node, node);
 

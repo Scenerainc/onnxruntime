@@ -3,9 +3,15 @@
 
 #include "core/providers/cuda/shared_inc/cudnn_fe_call.h"
 #include "core/providers/shared_library/provider_api.h"
+#ifdef BUILD_CUDA_EP_AS_PLUGIN
+#include "ep/adapters.h"
+#include "plugin/provider_api_shims.h"
+#else
 #include <core/platform/env.h>
-#if !defined(__CUDACC__)
+#endif
+#if !defined(__CUDACC__) && !defined(USE_CUDA_MINIMAL)
 #include <cudnn_frontend.h>
+#include "core/providers/cuda/cudnn_loader.h"
 #endif
 #ifdef _WIN32
 #else  // POSIX
@@ -22,7 +28,7 @@ const char* CudaErrString(ERRTYPE) {
   ORT_NOT_IMPLEMENTED();
 }
 
-#if !defined(__CUDACC__)
+#if !defined(__CUDACC__) && !defined(USE_CUDA_MINIMAL)
 #define CASE_ENUM_TO_STR_CUDNN_FE(x)    \
   case cudnn_frontend::error_code_t::x: \
     return #x
@@ -66,6 +72,18 @@ std::conditional_t<THRW, void, Status> CudaCall(
     ERRTYPE retCode, const char* exprString, const char* libName, SUCCTYPE successCode, const char* msg,
     const char* file, const int line) {
   if (retCode != successCode) {
+#if !defined(__CUDACC__) && !defined(USE_CUDA_MINIMAL)
+    if (!cuda::CudnnLibrary::Get().Available()) {
+      auto status = ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED,
+                                    "cuDNN is unavailable for CUDA Execution Provider: ",
+                                    cuda::CudnnLibrary::Get().Error());
+      if constexpr (THRW) {
+        ORT_THROW(status.ErrorMessage());
+      } else {
+        return status;
+      }
+    }
+#endif
     try {
 #ifdef _WIN32
       std::string hostname_str = GetEnvironmentVar("COMPUTERNAME");

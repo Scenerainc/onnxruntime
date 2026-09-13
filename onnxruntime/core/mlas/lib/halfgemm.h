@@ -32,9 +32,10 @@ Abstract:
 
 #pragma once
 
-#include <cstdlib>
 #include <cassert>
-#include <string>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 
 #include "mlasi.h"
 #include "mlas_float16.h"
@@ -49,6 +50,49 @@ struct MLAS_HALF_GEMM_STRIDES {
     size_t N;
     size_t K;
 };
+
+MLAS_FORCEINLINE
+bool
+MlasHalfGemmTryGetPackedBSize(
+    size_t N,
+    size_t K,
+    size_t PackedK,
+    size_t Padding,
+    size_t* PackedBSize
+    )
+{
+    if (N == 0 || K == 0) {
+        *PackedBSize = 0;
+        return true;
+    }
+
+    if (PackedK == 0) {
+        return false;
+    }
+
+    size_t aligned_k_input = 0;
+    if (MlasAddOverflowsSizeT(K, PackedK - 1, &aligned_k_input)) {
+        return false;
+    }
+
+    const size_t AlignedK = aligned_k_input & ~(PackedK - 1);
+
+    size_t BytesRequired = 0;
+    if (MlasMultiplyOverflowsSizeT(N, AlignedK, &BytesRequired) ||
+        MlasMultiplyOverflowsSizeT(BytesRequired, sizeof(_mlas_fp16_), &BytesRequired) ||
+        MlasAddOverflowsSizeT(BytesRequired, Padding, &BytesRequired)) {
+        return false;
+    }
+
+    const size_t BufferAlignment = MlasGetPreferredBufferAlignment();
+    size_t aligned_bytes_input = 0;
+    if (MlasAddOverflowsSizeT(BytesRequired, BufferAlignment - 1, &aligned_bytes_input)) {
+        return false;
+    }
+
+    *PackedBSize = aligned_bytes_input & ~(BufferAlignment - 1);
+    return true;
+}
 
 /**
  * @brief Packing function for fp16 B matrix
@@ -71,12 +115,51 @@ MlasHalfGemmCopyPackB(
     size_t CountK
 )
 {
-    MLAS_UNREFERENCED_PARAMETER(D);
-    MLAS_UNREFERENCED_PARAMETER(B);
-    MLAS_UNREFERENCED_PARAMETER(ldb);
-    MLAS_UNREFERENCED_PARAMETER(CountN);
-    MLAS_UNREFERENCED_PARAMETER(CountK);
-    // No packing needed by default
+    size_t aligned_count_k_input = 0;
+    if (MlasAddOverflowsSizeT(CountK, KernelType::PackedK - 1, &aligned_count_k_input)) {
+        assert(!"MlasHalfGemmCopyPackB aligned K overflow");
+        return;
+    }
+    const size_t AlignedCountK = aligned_count_k_input & ~(KernelType::PackedK - 1);
+    size_t PaddingCountK = AlignedCountK - CountK;
+
+    if (ldb == CountN) {
+        size_t elements_to_copy = 0;
+        size_t bytes_to_copy = 0;
+        if (MlasMultiplyOverflowsSizeT(CountK, CountN, &elements_to_copy) ||
+            MlasMultiplyOverflowsSizeT(elements_to_copy, sizeof(_mlas_fp16_), &bytes_to_copy)) {
+            assert(!"MlasHalfGemmCopyPackB size overflow");
+            return;
+        }
+        std::memcpy(D, B, bytes_to_copy);
+        if (PaddingCountK > 0) {
+            size_t padding_bytes = 0;
+            if (MlasMultiplyOverflowsSizeT(PaddingCountK, CountN, &padding_bytes) ||
+                MlasMultiplyOverflowsSizeT(padding_bytes, sizeof(_mlas_fp16_), &padding_bytes)) {
+                assert(!"MlasHalfGemmCopyPackB padding size overflow");
+                return;
+            }
+            std::memset(D + elements_to_copy, 0, padding_bytes);
+        }
+        return;
+    }
+
+    size_t row_bytes = 0;
+    if (MlasMultiplyOverflowsSizeT(CountN, sizeof(_mlas_fp16_), &row_bytes)) {
+        assert(!"MlasHalfGemmCopyPackB row size overflow");
+        return;
+    }
+    while (CountK > 0) {
+        std::memcpy(D, B, row_bytes);
+        B += ldb;
+        D += CountN;
+        CountK--;
+    }
+    while (PaddingCountK > 0) {
+        std::memset(D, 0, row_bytes);
+        D += CountN;
+        PaddingCountK--;
+    }
 }
 
 /**
@@ -503,13 +586,222 @@ extern const MLAS_HALFGEMM_DISPATCH MlasHalfGemmDispatchDefault;
 extern const MLAS_HALFGEMM_DISPATCH MlasHalfGemmDispatchNeon;
 #endif
 
+#if defined(MLAS_TARGET_RISCV64) && defined(MLAS_USE_RVV_ZVFH)
+extern const MLAS_HALFGEMM_DISPATCH MlasHalfGemmDispatchRvv;
+#endif
+
 MLAS_FORCEINLINE
 const MLAS_HALFGEMM_DISPATCH*
 MlasHalfGemmGetDispatch()
 {
 #if defined(MLAS_F16VEC_INTRINSICS_SUPPORTED) && defined(MLAS_TARGET_ARM64)
-    return &MlasHalfGemmDispatchNeon;
+    if (MLAS_CPUIDINFO::GetCPUIDInfo().HasFp16VectorAcceleration()) {
+        return &MlasHalfGemmDispatchNeon;
+    }
+    return &MlasHalfGemmDispatchDefault;
+#elif defined(MLAS_TARGET_RISCV64) && defined(MLAS_USE_RVV_ZVFH)
+    if (MLAS_CPUIDINFO::GetCPUIDInfo().HasFp16VectorAcceleration()) {
+        return &MlasHalfGemmDispatchRvv;
+    }
+    return &MlasHalfGemmDispatchDefault;
 #else
     return &MlasHalfGemmDispatchDefault;
 #endif
 }
+
+namespace hgemm_neon {
+
+void HPackB_TransposedB_Kernel(
+    const MLAS_FP16* B,
+    MLAS_FP16* PackedB,
+    size_t CountN,
+    size_t CountK,
+    size_t ldb
+);
+
+void HPackB_B_Kernel(
+    const MLAS_FP16* B,
+    MLAS_FP16* PackedB,
+    size_t CountN,
+    size_t CountK,
+    size_t ldb
+);
+
+void HGemm_TransposedB_Kernel(
+    const MLAS_FP16* A,
+    const MLAS_FP16* B,
+    MLAS_FP16* C,
+    size_t CountM,
+    size_t CountN,
+    size_t CountK,
+    size_t lda,
+    size_t ldb,
+    size_t ldc,
+    _mlas_fp16_ alpha,
+    _mlas_fp16_ beta
+);
+
+void HGemm_B_Kernel(
+    const MLAS_FP16* A,
+    const MLAS_FP16* B,
+    MLAS_FP16* C,
+    size_t CountM,
+    size_t CountN,
+    size_t CountK,
+    size_t lda,
+    size_t ldb,
+    size_t ldc,
+    _mlas_fp16_ alpha,
+    _mlas_fp16_ beta
+);
+
+void HGemm_PackedB_Kernel(
+    const MLAS_FP16* A,
+    const MLAS_FP16* PackedB,
+    MLAS_FP16* C,
+    size_t CountM,
+    size_t CountN,
+    size_t CountK,
+    size_t lda,
+    size_t ldc,
+    _mlas_fp16_ alpha,
+    _mlas_fp16_ beta
+);
+
+}  // namespace hgemm_neon
+
+struct MLAS_HGEMM_DISPATCH {
+    /**
+     * @brief Pack the B matrix segment. B is column-major. Elements from CountK rows x N columns are packed
+     *        continuously in row-major.
+     *        First pack CountK rows x 32 columns, then pack CountK rows x 16 columns, then 8.
+     *        If there are < 8 columns left, pad the columns with 0.
+     * @param      B                   the first element of the B matrix segment. Column major.
+     * @param[out] PackedB             the first element of the packed B matrix segment.
+     * @param      CountN              the number of columns of B chunk.
+     * @param      CountK              the number of rows of B chunk.
+     * @param      ldb                 the leading dimension of B.
+     */
+    typedef void(HPackBKernel_TransposedB_Fn) (
+        const MLAS_FP16* B,
+        MLAS_FP16* PackedB,
+        size_t CountN,
+        size_t CountK,
+        size_t ldb
+    );
+
+    HPackBKernel_TransposedB_Fn* HPackBKernel_TransposedB = nullptr;
+
+    /**
+     * @brief Pack the B matrix segment. B is row-major. Elements from CountK rows x N columns are packed
+     *        continuously in row-major.
+     *        First pack CountK rows x 32 columns, then pack CountK rows x 16 columns, then 8.
+     *        If there are < 8 columns left, pad the columns with 0.
+     * @param      B                   the first element of the B matrix segment. Row major.
+     * @param[out] PackedB             the first element of the packed B matrix segment.
+     * @param      CountN              the number of columns of B chunk.
+     * @param      CountK              the number of rows of B chunk.
+     * @param      ldb                 the leading dimension of B.
+     */
+    typedef void(HPackBKernel_B_Fn) (
+        const MLAS_FP16* B,
+        MLAS_FP16* PackedB,
+        size_t CountN,
+        size_t CountK,
+        size_t ldb
+    );
+
+    HPackBKernel_B_Fn* HPackBKernel_B = nullptr;
+
+    /**
+     * @brief C = alpha * A * Transpose(B) + beta * C. CountM <= 2. B is not packed. Used when M is small.
+     *
+     * @param       A                   first row of the A matrix segment. Row major.
+     * @param       B                   first column of the B matrix segment. Column major.
+     * @param[out]  C                   first element of the output matrix segment. Row major.
+     * @param       CountM              the number of rows of A chunk.
+     * @param       CountN              the number of columns of B chunk.
+     * @param       CountK              the number of columns of A chunk and the number of rows of B chunk.
+     * @param       lda                 the leading dimension of A.
+     * @param       ldb                 the leading dimension of B.
+     * @param       ldc                 the leading dimension of C.
+     * @param       alpha               the alpha scalar value.
+     * @param       beta                the beta scalar value.
+     */
+    typedef void(HGemmKernel_TransposedB_Fn)(
+        const MLAS_FP16* A,
+        const MLAS_FP16* B,
+        MLAS_FP16* C,
+        size_t CountM,
+        size_t CountN,
+        size_t CountK,
+        size_t lda,
+        size_t ldb,
+        size_t ldc,
+        _mlas_fp16_ alpha,
+        _mlas_fp16_ beta
+    );
+
+    HGemmKernel_TransposedB_Fn* HGemmKernel_TransposedB = nullptr;
+
+    /**
+     * @brief C = alpha * A * B + beta * C. CountM <= 2. B is not packed. Used when M is small.
+     *
+     * @param       A                   first row of the A matrix segment. Row major.
+     * @param       B                   first row of the B matrix segment. Row major.
+     * @param[out]  C                   first element of the output matrix segment. Row major.
+     * @param       CountM              the number of rows of A chunk.
+     * @param       CountN              the number of columns of B chunk.
+     * @param       CountK              the number of columns of A chunk and the number of rows of B chunk.
+     * @param       lda                 the leading dimension of A.
+     * @param       ldb                 the leading dimension of B.
+     * @param       ldc                 the leading dimension of C.
+     * @param       alpha               the alpha scalar value.
+     * @param       beta                the beta scalar value.
+     */
+    typedef void(HGemmKernel_B_Fn)(
+        const MLAS_FP16* A,
+        const MLAS_FP16* B,
+        MLAS_FP16* C,
+        size_t CountM,
+        size_t CountN,
+        size_t CountK,
+        size_t lda,
+        size_t ldb,
+        size_t ldc,
+        _mlas_fp16_ alpha,
+        _mlas_fp16_ beta
+    );
+
+    HGemmKernel_B_Fn* HGemmKernel_B = nullptr;
+
+    /**
+     * @brief C = alpha * A * Transpose(B) + beta * C. CountM <= 2. B has been packed using
+     *        HPackBKernel_TransposedB_Fn or HPackBKernel_B_Fn. Use when M is large.
+     *
+     * @param       A                   first row of the A matrix segment. Row major.
+     * @param       PackedB             first element of the packed B buffer.
+     * @param[out]  C                   first element of the output matrix segment. Row major.
+     * @param       CountM              the number of rows of A chunk.
+     * @param       CountN              the number of columns of B chunk.
+     * @param       CountK              the number of columns of A chunk and the number of rows of B chunk.
+     * @param       lda                 the leading dimension of A.
+     * @param       ldc                 the leading dimension of C.
+     * @param       alpha               the alpha scalar value.
+     * @param       beta                the beta scalar value.
+     */
+    typedef void(HGemmKernel_PackedB_Fn)(
+        const MLAS_FP16* A,
+        const MLAS_FP16* PackedB,
+        MLAS_FP16* C,
+        size_t CountM,
+        size_t CountN,
+        size_t CountK,
+        size_t lda,
+        size_t ldc,
+        _mlas_fp16_ alpha,
+        _mlas_fp16_ beta
+    );
+
+    HGemmKernel_PackedB_Fn* HGemmKernel_PackedB = nullptr;
+};

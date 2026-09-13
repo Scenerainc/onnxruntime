@@ -6,11 +6,11 @@
 # It is used to dump machine information for Notebooks
 
 import argparse
+import importlib.metadata
 import json
 import logging
 import platform
 from os import environ
-from typing import Dict, List
 
 import cpuinfo
 import psutil
@@ -66,12 +66,12 @@ class MachineInfo:
         }
         return machine_info
 
-    def get_memory_info(self) -> Dict:
+    def get_memory_info(self) -> dict:
         """Get memory info"""
         mem = psutil.virtual_memory()
         return {"total": mem.total, "available": mem.available}
 
-    def _try_get(self, cpu_info: Dict, names: List) -> str:
+    def _try_get(self, cpu_info: dict, names: list) -> str:
         for name in names:
             if name in cpu_info:
                 value = cpu_info[name]
@@ -80,7 +80,7 @@ class MachineInfo:
                 return value
         return ""
 
-    def get_cpu_info(self) -> Dict:
+    def get_cpu_info(self) -> dict:
         """Get CPU info"""
         cpu_info = cpuinfo.get_cpu_info()
 
@@ -94,7 +94,7 @@ class MachineInfo:
             "processor": platform.uname().processor,
         }
 
-    def get_gpu_info_by_nvml(self) -> Dict:
+    def get_gpu_info_by_nvml(self) -> dict:
         """Get GPU info using nvml"""
         gpu_info_list = []
         driver_version = None
@@ -122,11 +122,8 @@ class MachineInfo:
             result["cuda_visible"] = environ["CUDA_VISIBLE_DEVICES"]
         return result
 
-    def get_related_packages(self) -> List[str]:
-        import pkg_resources
-
-        installed_packages = pkg_resources.working_set
-        related_packages = [
+    def get_related_packages(self) -> list[str]:
+        related_packages = {
             "onnxruntime-gpu",
             "onnxruntime",
             "onnx",
@@ -138,13 +135,17 @@ class MachineInfo:
             "flatbuffers",
             "numpy",
             "onnxconverter-common",
-        ]
-        related_packages_list = {i.key: i.version for i in installed_packages if i.key in related_packages}
+        }
+        related_packages_list = {}
+        for dist in importlib.metadata.distributions():
+            if dist.metadata["Name"].lower() in related_packages:
+                related_packages_list[dist.metadata["Name"].lower()] = dist.version
+
         return related_packages_list
 
-    def get_onnxruntime_info(self) -> Dict:
+    def get_onnxruntime_info(self) -> dict:
         try:
-            import onnxruntime
+            import onnxruntime  # noqa: PLC0415
 
             return {
                 "version": onnxruntime.__version__,
@@ -159,9 +160,9 @@ class MachineInfo:
                 self.logger.exception(exception, False)
             return None
 
-    def get_pytorch_info(self) -> Dict:
+    def get_pytorch_info(self) -> dict:
         try:
-            import torch
+            import torch  # noqa: PLC0415
 
             return {
                 "version": torch.__version__,
@@ -177,9 +178,9 @@ class MachineInfo:
                 self.logger.exception(exception, False)
             return None
 
-    def get_tensorflow_info(self) -> Dict:
+    def get_tensorflow_info(self) -> dict:
         try:
-            import tensorflow as tf
+            import tensorflow as tf  # noqa: PLC0415
 
             return {
                 "version": tf.version.VERSION,
@@ -214,6 +215,14 @@ def parse_arguments():
 def get_machine_info(silent=True) -> str:
     machine = MachineInfo(silent)
     return json.dumps(machine.machine_info, indent=2)
+
+
+def get_device_info(silent=True) -> str:
+    machine = MachineInfo(silent)
+    info = machine.machine_info
+    if info:
+        info = {key: value for key, value in info.items() if key in ["gpu", "cpu", "memory"]}
+    return json.dumps(info, indent=2)
 
 
 if __name__ == "__main__":

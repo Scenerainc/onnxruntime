@@ -98,6 +98,31 @@ TEST(ImageScalerContribOpTest, ImageScalerTest) {
   test.Run();
 }
 
+TEST(ImageScalerContribOpTest, ImageScalerEmptyBias) {
+  if (DefaultDmlExecutionProvider().get() != nullptr) {
+    GTEST_SKIP() << "Skipping because of the following error: AbiCustomRegistry.cpp(507): The parameter is incorrect.";
+  }
+
+  constexpr int64_t N = 1, C = 2, H = 2, W = 2;
+  std::vector<float> X = {
+      1.0f, 3.0f,
+      3.0f, 5.0f,
+
+      3.0f, 5.0f,
+      7.0f, 9.0f};
+
+  // A present-but-empty bias supplies no value for any channel and must be rejected rather than
+  // indexing an empty vector.
+  OpTester test("ImageScaler");
+  test.AddAttribute("scale", 2.0f);
+  test.AddAttribute("bias", std::vector<float>{});
+  test.AddInput<float>("input", {N, C, H, W}, X);
+  test.AddOutput<float>("output", {N, C, H, W}, std::vector<float>(N * C * H * W, 0.0f));
+  test.Run(OpTester::ExpectResult::kExpectFailure,
+           "Bias size (0) does not match the number of channels (2)",
+           {kTensorrtExecutionProvider});
+}
+
 void MeanVarianceNormalizationAcrossChannels(bool across_channels, bool normalize_variance) {
   constexpr int64_t N = 2, C = 2, H = 2, W = 3;
   constexpr int64_t one = 1;
@@ -121,15 +146,12 @@ void MeanVarianceNormalizationAcrossChannels(bool across_channels, bool normaliz
   test.AddAttribute("normalize_variance", normalize_variance ? one : zero);
   test.AddInput<float>("input", {N, C, H, W}, X);
   test.AddOutput<float>("output", {N, C, H, W}, result);
-#if defined(USE_CUDA) && defined(USE_DML)
-  if (DefaultCudaExecutionProvider() == nullptr) {
-    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider, kCudaExecutionProvider, kTensorrtExecutionProvider});
-  } else if (DefaultDmlExecutionProvider() == nullptr) {
-    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider, kDmlExecutionProvider, kTensorrtExecutionProvider});
-  }
-#else
-  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider, kTensorrtExecutionProvider});  // OpenVINO doesn't support MVN operator below opset 9. TensorRT doesn't support opset 8 of MVN operator.
-#endif
+  // DML currently has known failures in this 4D MVN coverage.
+  // See https://github.com/microsoft/onnxruntime/issues/27933 and remove this exclusion once
+  // that issue is fixed. OpenVINO does not support MVN below opset 9. TensorRT does not
+  // support MVN opset 8.
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "",
+           {kDmlExecutionProvider, kOpenVINOExecutionProvider, kTensorrtExecutionProvider});
 }
 
 void MeanVarianceNormalizationPerChannel(bool across_channels, bool normalize_variance) {
@@ -196,15 +218,12 @@ void MeanVarianceNormalizationPerChannel(bool across_channels, bool normalize_va
   test.AddAttribute("normalize_variance", normalize_variance ? one : zero);
   test.AddInput<float>("input", {N, C, H, W}, X);
   test.AddOutput<float>("output", {N, C, H, W}, result);
-#if defined(USE_CUDA) && defined(USE_DML)
-  if (DefaultCudaExecutionProvider() == nullptr) {
-    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider, kCudaExecutionProvider, kTensorrtExecutionProvider});
-  } else if (DefaultDmlExecutionProvider() == nullptr) {
-    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider, kDmlExecutionProvider, kTensorrtExecutionProvider});
-  }
-#else
-  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider, kTensorrtExecutionProvider});  // OpenVINO doesn't support MVN operator below opset 9. TensorRT doesn't support opset 8 of MVN operator.
-#endif
+  // OpenVINO does not support MVN below opset 9. TensorRT does not support MVN opset 8.
+  // DML currently has known failures in this 4D MVN coverage.
+  // See https://github.com/microsoft/onnxruntime/issues/27933 and remove this exclusion once
+  // that issue is fixed.
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "",
+           {kDmlExecutionProvider, kOpenVINOExecutionProvider, kTensorrtExecutionProvider});
 }
 
 TEST(MVNContribOpTest, MeanVarianceNormalizationCPUTest_Version1_TO_8) {
@@ -246,9 +265,7 @@ TEST(UnfoldTensorOpTest, LastDim) {
 
   std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
 #ifdef USE_CUDA
-  if (DefaultCudaExecutionProvider() != nullptr) {
-    execution_providers.push_back(DefaultCudaExecutionProvider());
-  }
+  execution_providers.push_back(DefaultCudaExecutionProvider());
 #endif
   execution_providers.push_back(DefaultCpuExecutionProvider());
   tester.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);

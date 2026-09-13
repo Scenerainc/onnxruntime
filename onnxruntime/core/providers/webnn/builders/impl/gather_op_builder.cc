@@ -20,10 +20,10 @@ class GatherOpBuilder : public BaseOpBuilder {
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
 
   // Operator support related.
-  bool IsOpSupportedImpl(const InitializedTensorSet& /* initializers */, const Node& node,
-                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
-  bool HasSupportedInputsImpl(const Node& node, const emscripten::val& wnn_limits,
-                              const logging::Logger& logger) const override;
+  bool HasSupportedInputsImpl(const GraphViewer&, const Node& node,
+                              const emscripten::val& wnn_limits, const logging::Logger& logger) const override;
+  bool HasSupportedOutputsImpl(const Node& node, const emscripten::val& wnn_limits,
+                               const logging::Logger& logger) const override;
 };
 
 // Add operator related.
@@ -50,38 +50,47 @@ Status GatherOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 }
 
 // Operator support related.
-
-bool GatherOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& /* initializers */,
-                                        const Node& node,
-                                        const WebnnDeviceType /* device_type */,
-                                        const logging::Logger& logger) const {
-  const auto& input_defs = node.InputDefs();
-  std::vector<int64_t> input_shape;
-  if (!GetShape(*input_defs[0], input_shape, logger))
-    return false;
-  const auto rank = input_shape.size();
-  if (rank < 1) {
-    LOGS(logger, VERBOSE) << "Gather only supports input shapes >= 1D, but input is "
-                          << rank << "d shape";
-    return false;
-  }
-
-  return true;
-}
-
-bool GatherOpBuilder::HasSupportedInputsImpl(const Node& node, const emscripten::val& wnn_limits,
-                                             const logging::Logger& logger) const {
+bool GatherOpBuilder::HasSupportedInputsImpl(const GraphViewer&, const Node& node,
+                                             const emscripten::val& wnn_limits, const logging::Logger& logger) const {
   const auto& input = *node.InputDefs()[0];
   const auto& indices = *node.InputDefs()[1];
-  const auto& op_type = node.OpType();
-  int32_t input_type;
-  int32_t indices_type;
+  const std::string_view op_type = node.OpType();
+  int32_t input_type, indices_type;
+
   if (!GetType(input, input_type, logger) ||
       !GetType(indices, indices_type, logger))
     return false;
 
   return IsDataTypeSupportedByOp(op_type, input_type, wnn_limits, "input", "data", logger) &&
-         IsDataTypeSupportedByOp(op_type, indices_type, wnn_limits, "indices", "indices", logger);
+         IsDataTypeSupportedByOp(op_type, indices_type, wnn_limits, "indices", "indices", logger) &&
+         IsInputRankSupportedByOp(node, wnn_limits, logger);
+}
+
+bool GatherOpBuilder::HasSupportedOutputsImpl(const Node& node, const emscripten::val& wnn_limits,
+                                              const logging::Logger& logger) const {
+  const auto& output = *node.OutputDefs()[0];
+  const std::string_view op_type = node.OpType();
+  int32_t output_type;
+  if (!GetType(output, output_type, logger)) {
+    return false;
+  }
+  if (!IsDataTypeSupportedByOp(op_type, output_type, wnn_limits, "output", "Output", logger)) {
+    return false;
+  }
+
+  std::vector<int64_t> output_shape;
+  if (!GetShape(output, output_shape, logger)) {
+    return false;
+  }
+
+  // WebNN gather allows 0-D indices, so a 1-D input with a scalar index yields a valid 0-D output.
+  // The gather output rankRange is currently reported with min=1 (a WebNN impl+spec bug), which would
+  // wrongly reject this. Skip the rank check for 0-D output; rank >= 1 still checks the max.
+  // TODO: remove once WebNN gather output rankRange.min is corrected to 0.
+  if (output_shape.empty()) {
+    return true;
+  }
+  return IsOutputRankSupportedByOp(node, wnn_limits, logger);
 }
 
 void CreateGatherOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {

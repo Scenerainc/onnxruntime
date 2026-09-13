@@ -5,6 +5,7 @@
 #include "testlog.h"
 #include "OnnxPrediction.h"
 #include "onnxruntime_session_options_config_keys.h"
+#include "test/util/include/telemetry_test_environment.h"
 #include <type_traits>
 
 using user_options = struct
@@ -278,11 +279,9 @@ static void fuzz_handle_exception(struct RunStats& run_stats) {
 }
 
 int main(int argc, char* argv[]) {
+  onnxruntime::test::SuppressTelemetryForTests();
   Ort::Env env;
-  // Enable telemetry events
-  //
-  env.EnableTelemetryEvents();
-  struct RunStats run_stats {};
+  struct RunStats run_stats{};
   runtimeOpt opt{};
   user_options& user_opt{opt.user_opt};
   Logger::wcstream& werr_stream_buf{opt.werr_stream_buf};
